@@ -27,13 +27,8 @@ class Settings:
     # Scanning
     MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))
     DEFAULT_TICKERS = [
-    "SPY", "QQQ", "IWM", "DIA", "IBIT", "KRE", "SOXX", "GLD", "SLV", "NVDA", "AAPL", 
-    "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NFLX", "AVGO", "TSM", "AMD", "MRVL", "INTC", 
-    "ARM", "QCOM", "ASML", "AMAT", "LRCX", "WMT", "COST", "ORCL", "PLTR", "PANW", "CRWD", 
-    "JPM", "BAC", "SCHW", "BLK", "AFRM", "HOOD", "SOFI", "AAL", "DAL", "UAL", "CCL", "RTX", 
-    "ISRG", "LLY", "TEM", "DOCS", "NNE", "SMR", "SCCO", "FCX", "MP", "EXPE", "UBER", "COIN", 
-    "BABA", "BIDU", "IONQ", "QBTS", "RGTI", "RR", "LUNR", "RKLB", "OKLO", "DHI"
-]
+        "NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "TSM", "IBIT"
+    ]
     
     # Market Hours (US Eastern Time)
     TIMEZONE = pytz.timezone('America/New_York')
