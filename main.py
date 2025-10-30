@@ -53,7 +53,7 @@ market_analyzer = MarketAnalyzer()
 
 # Default tickers
 DEFAULT_TICKERS = [
-    "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META"
+    "NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "TSM", "IBIT"
 ]
 
 # ============================================================================
