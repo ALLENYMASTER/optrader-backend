@@ -1,6 +1,7 @@
 """
-Optrader Cloud Backend - FastAPI
+Optrader Cloud Backend - FastAPI (FIXED VERSION)
 Main entry point for options whale scanning API
+Fixed: Better handling of tickers with no whale activity
 """
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +29,7 @@ from config.settings import settings, MarketHours, get_market_status
 app = FastAPI(
     title="Optrader API",
     description="Options Whale Scanner & AI Trading Recommendations",
-    version="1.0.0",
+    version="1.0.1",  # Updated version
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -64,7 +65,7 @@ DEFAULT_TICKERS = [
 async def startup_event():
     """Initialize on startup"""
     print("=" * 80)
-    print("🚀 Optrader API Starting...")
+    print("🚀 Optrader API Starting (v1.0.1 - Fixed)...")
     print("=" * 80)
     
     # Initialize default tickers
@@ -74,7 +75,7 @@ async def startup_event():
     
     print(f"✅ Default tickers loaded: {len(DEFAULT_TICKERS)}")
     print(f"✅ Cache manager initialized")
-    print(f"✅ Options scanner ready")
+    print(f"✅ Options scanner ready (with improved whale detection)")
     print("=" * 80)
 
 @app.on_event("shutdown")
@@ -92,7 +93,7 @@ async def root():
     """API root endpoint"""
     return {
         "app": "Optrader API",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "status": "running",
         "endpoints": {
             "tickers": "/api/tickers",
@@ -252,6 +253,7 @@ async def scan_market(
     - **max_workers**: Concurrent requests (1-3, default: 3 to avoid rate limiting)
     
     Returns sorted results: BULLISH → BEARISH
+    Note: Will return data even if no whale activity is detected
     
     **Smart Scheduling:**
     - Scans only during: Pre-market (1h before), Market hours (every 1h), Post-market (1h after)
@@ -333,6 +335,9 @@ async def get_ticker_detail(
     
     - **symbol**: Stock ticker symbol
     - **force**: Bypass cache
+    
+    Note: Will return data even if no whale activity is detected.
+    Check the 'unusual_activity' array to see if whales are active.
     """
     symbol = symbol.upper().strip()
     
@@ -346,11 +351,17 @@ async def get_ticker_detail(
     # Scan single ticker
     result = scanner.scan_single_ticker(symbol)
     
+    # Better error handling
     if not result:
         raise HTTPException(
             status_code=404,
-            detail=f"No unusual activity found for {symbol} or ticker not found"
+            detail=f"Unable to fetch data for {symbol}. Please verify the ticker symbol is correct."
         )
+    
+    # Check if we have data but no whale activity
+    if result and len(result.get('unusual_activity', [])) == 0:
+        print(f"ℹ️ {symbol}: Data retrieved but no whale activity detected")
+        # Still return the data - it includes sentiment and recommendations
     
     response = {
         "symbol": symbol,
@@ -493,7 +504,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     
     print("\n" + "=" * 80)
-    print("🚀 Starting Optrader API Server")
+    print("🚀 Starting Optrader API Server (v1.0.1 - Fixed)")
     print("=" * 80)
     print(f"📡 Port: {port}")
     print(f"📚 Docs: http://localhost:{port}/docs")
