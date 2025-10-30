@@ -12,8 +12,6 @@ import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, List, Any
-import time
-from tenacity import retry, stop_after_attempt, wait_exponential
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -57,7 +55,7 @@ class OptionsWhaleScanner:
         
         return results
     
-    def scan_all_parallel(self, tickers: list, max_workers: int = 5) -> list:
+    def scan_all_parallel(self, tickers: list, max_workers: int = 2) -> list:
         """Scan tickers in parallel with rate limiting"""
         results = []
         
@@ -233,11 +231,11 @@ class OptionsWhaleScanner:
                 'strategy_type'
             ] = 'STRADDLE/STRANGLE'
             
-            # Filter unusual activity
+            # Filter unusual activity - RELAXED for testing
             unusual = df[
-                (df['volume'] > 100) & 
-                (df['total_volume_value'] > 50000) &
-                (df['volume_oi_ratio'] > 0.3) &
+                (df['volume'] > 50) &              # Lower from 100
+                (df['total_volume_value'] > 25000) & # Lower from 50000
+                (df['volume_oi_ratio'] > 0.2) &    # Lower from 0.3
                 (df['lastPrice'] > 0.05)
             ].copy()
             
@@ -540,4 +538,4 @@ class OptionsWhaleScanner:
         confidence_order = {'HIGH': 3, 'MEDIUM-HIGH': 2.5, 'MEDIUM': 2, 'LOW-MEDIUM': 1.5, 'LOW': 1}
         recommendations.sort(key=lambda x: confidence_order.get(x['confidence'], 0), reverse=True)
         
-        return recommendations[:5]  # Top 5 strategies
+        return recommendations[:3]  # Top 5 strategies
