@@ -58,14 +58,24 @@ class OptionsWhaleScanner:
         return results
     
     def scan_all_parallel(self, tickers: list, max_workers: int = 5) -> list:
-        """Scan tickers in parallel"""
+        """Scan tickers in parallel with rate limiting"""
         results = []
         
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_ticker = {
-                executor.submit(self.scan_single_ticker, ticker): ticker 
-                for ticker in tickers
-            }
+        # Reduce workers to avoid rate limiting
+        safe_workers = min(max_workers, 3)  # Max 3 concurrent requests
+        
+        with ThreadPoolExecutor(max_workers=safe_workers) as executor:
+            future_to_ticker = {}
+            
+            # Submit with delay to avoid rate limiting
+            for i, ticker in enumerate(tickers):
+                # Add 200ms delay between submissions
+                if i > 0:
+                    import time
+                    time.sleep(0.2)
+                
+                future = executor.submit(self.scan_single_ticker, ticker)
+                future_to_ticker[future] = ticker
             
             for future in as_completed(future_to_ticker):
                 ticker = future_to_ticker[future]
@@ -80,66 +90,90 @@ class OptionsWhaleScanner:
         
         return results
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     def _get_options_data(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """Fetch comprehensive options data from yfinance"""
-        try:
-            stock = yf.Ticker(ticker)
-            info = stock.info
-            current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
-            
-            if current_price == 0:
-                return None
-            
-            # Get additional market metrics
-            volume = info.get('volume', 0)
-            avg_volume = info.get('averageVolume', 1)
-            market_cap = info.get('marketCap', 0)
-            
-            expirations = stock.options
-            if not expirations:
-                return None
-            
-            all_calls = []
-            all_puts = []
-            cutoff_date = datetime.now() + timedelta(days=90)
-            
-            # Fetch first 6 expirations (up to 90 days)
-            for exp_date in expirations[:6]:
-                exp_datetime = datetime.strptime(exp_date, '%Y-%m-%d')
-                if exp_datetime > cutoff_date:
-                    continue
+        """Fetch comprehensive options data from yfinance with retry logic"""
+        import time
+        
+        max_retries = 3
+        retry_delay = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Add small delay to avoid rate limiting
+                if attempt > 0:
+                    time.sleep(retry_delay * attempt)
                 
-                opt_chain = stock.option_chain(exp_date)
+                stock = yf.Ticker(ticker)
+                info = stock.info
+                current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
                 
-                calls = opt_chain.calls.copy()
-                calls['expiration'] = exp_date
-                calls['type'] = 'call'
-                calls['days_to_expiry'] = (exp_datetime - datetime.now()).days
-                all_calls.append(calls)
+                if current_price == 0:
+                    return None
                 
-                puts = opt_chain.puts.copy()
-                puts['expiration'] = exp_date
-                puts['type'] = 'put'
-                puts['days_to_expiry'] = (exp_datetime - datetime.now()).days
-                all_puts.append(puts)
-            
-            calls_df = pd.concat(all_calls, ignore_index=True) if all_calls else pd.DataFrame()
-            puts_df = pd.concat(all_puts, ignore_index=True) if all_puts else pd.DataFrame()
-            
-            return {
-                'ticker': ticker,
-                'current_price': current_price,
-                'volume': volume,
-                'avg_volume': avg_volume,
-                'volume_ratio': volume / avg_volume if avg_volume > 0 else 0,
-                'market_cap': market_cap,
-                'calls': calls_df,
-                'puts': puts_df
-            }
-        except Exception as e:
-            print(f"Error fetching data for {ticker}: {e}")
-            return None
+                # Get additional market metrics
+                volume = info.get('volume', 0)
+                avg_volume = info.get('averageVolume', 1)
+                market_cap = info.get('marketCap', 0)
+                
+                # Add delay before options request
+                time.sleep(0.3)
+                
+                expirations = stock.options
+                if not expirations:
+                    return None
+                
+                all_calls = []
+                all_puts = []
+                cutoff_date = datetime.now() + timedelta(days=90)
+                
+                # Fetch first 6 expirations (up to 90 days)
+                for exp_date in expirations[:6]:
+                    exp_datetime = datetime.strptime(exp_date, '%Y-%m-%d')
+                    if exp_datetime > cutoff_date:
+                        continue
+                    
+                    # Add delay between expiration fetches
+                    time.sleep(0.2)
+                    
+                    opt_chain = stock.option_chain(exp_date)
+                    
+                    calls = opt_chain.calls.copy()
+                    calls['expiration'] = exp_date
+                    calls['type'] = 'call'
+                    calls['days_to_expiry'] = (exp_datetime - datetime.now()).days
+                    all_calls.append(calls)
+                    
+                    puts = opt_chain.puts.copy()
+                    puts['expiration'] = exp_date
+                    puts['type'] = 'put'
+                    puts['days_to_expiry'] = (exp_datetime - datetime.now()).days
+                    all_puts.append(puts)
+                
+                calls_df = pd.concat(all_calls, ignore_index=True) if all_calls else pd.DataFrame()
+                puts_df = pd.concat(all_puts, ignore_index=True) if all_puts else pd.DataFrame()
+                
+                return {
+                    'ticker': ticker,
+                    'current_price': current_price,
+                    'volume': volume,
+                    'avg_volume': avg_volume,
+                    'volume_ratio': volume / avg_volume if avg_volume > 0 else 0,
+                    'market_cap': market_cap,
+                    'calls': calls_df,
+                    'puts': puts_df
+                }
+            except Exception as e:
+                error_msg = str(e)
+                if "429" in error_msg or "Too Many Requests" in error_msg:
+                    print(f"⚠️ Rate limited on {ticker}, attempt {attempt + 1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay * (attempt + 2))  # Exponential backoff
+                        continue
+                print(f"Error fetching data for {ticker}: {e}")
+                if attempt == max_retries - 1:
+                    return None
+        
+        return None
     
     def _identify_whale_activity(self, options_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Identify unusual options activity with enhanced analysis"""
@@ -199,11 +233,11 @@ class OptionsWhaleScanner:
                 'strategy_type'
             ] = 'STRADDLE/STRANGLE'
             
-            # Filter unusual activity (#: If market is quiet)
+            # Filter unusual activity
             unusual = df[
-                (df['volume'] > 100) &  # 50
-                (df['total_volume_value'] > 50000) &  # 25000
-                (df['volume_oi_ratio'] > 0.3) &  # 0.2
+                (df['volume'] > 100) & 
+                (df['total_volume_value'] > 50000) &
+                (df['volume_oi_ratio'] > 0.3) &
                 (df['lastPrice'] > 0.05)
             ].copy()
             

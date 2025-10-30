@@ -244,7 +244,8 @@ async def scan_market(
     user_id: str = Query("default", description="User ID"),
     force: bool = Query(False, description="Force refresh (bypass cache)"),
     parallel: bool = Query(True, description="Use parallel scanning"),
-    ignore_hours: bool = Query(False, description="Ignore market hours check")
+    ignore_hours: bool = Query(False, description="Ignore market hours check"),
+    max_workers: int = Query(3, description="Max concurrent requests (1-3, lower = safer)")
 ):
     """
     Scan user's tickers for whale activity
@@ -253,13 +254,21 @@ async def scan_market(
     - **force**: Bypass cache and force new scan
     - **parallel**: Use parallel scanning (faster, default: True)
     - **ignore_hours**: Bypass market hours check (default: False)
+    - **max_workers**: Concurrent requests (1-3, default: 3 to avoid rate limiting)
     
     Returns sorted results: BULLISH → BEARISH
     
     **Smart Scheduling:**
     - Scans only during: Pre-market (1h before), Market hours (every 1h), Post-market (1h after)
     - Use `ignore_hours=true` to force scan anytime
+    
+    **Rate Limiting:**
+    - Default max_workers=3 to avoid yfinance 429 errors
+    - Increase only if needed and willing to risk rate limits
     """
+    
+    # Validate max_workers
+    max_workers = min(max(1, max_workers), 3)  # Clamp to 1-3
     
     # Check market hours (unless ignored)
     if not ignore_hours:
@@ -295,10 +304,10 @@ async def scan_market(
         )
     
     # Scan tickers
-    print(f"📊 Scanning {len(tickers)} tickers for user: {user_id}")
+    print(f"📊 Scanning {len(tickers)} tickers for user: {user_id} (workers: {max_workers})")
     
     if parallel:
-        results = scanner.scan_all_parallel(tickers, max_workers=5)
+        results = scanner.scan_all_parallel(tickers, max_workers=max_workers)
     else:
         results = scanner.scan_all_sequential(tickers)
     
