@@ -8,10 +8,11 @@ nixPkgs = ["python311Full", "python311Packages.pip", "gcc"]
 [phases.install]
 cacheDirectories = ["/root/.cache/pip"]
 cmds = [
-  # Create and use a writable venv for pip installs (all in one shell)
-  "python -m venv /app/venv && 
-   /app/venv/bin/pip install --upgrade pip && 
-   /app/venv/bin/pip install --no-cache-dir -r requirements.txt"
+  """
+  python -m venv /app/venv && \
+  /app/venv/bin/pip install --upgrade pip && \
+  /app/venv/bin/pip install --no-cache-dir -r requirements.txt
+  """
 ]
 
 [phases.build]
