@@ -1,15 +1,15 @@
-# Explicitly tell Nixpacks to use Python
+# Force Python + pip installation at the system level
 [build]
 language = "python"
 
 [phases.setup]
-nixPkgs = ["python311Full"]
+# Explicitly include pip as a nix package (this guarantees it's available)
+nixPkgs = ["python311Full", "python311Packages.pip", "gcc"]
 
 [phases.install]
 cacheDirectories = ["/root/.cache/pip"]
 cmds = [
-  "python -m pip install --upgrade pip",
-  "python -m pip install --no-cache-dir -r requirements.txt"
+  "pip install --no-cache-dir -r requirements.txt"
 ]
 
 [phases.build]
