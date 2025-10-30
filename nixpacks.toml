@@ -1,20 +1,17 @@
-# Use full Python environment (includes pip)
+# Full Python + pip environment (no ensurepip needed)
 [phases.setup]
 nixPkgs = ["python311Full"]
 
-# Cache dependencies between builds for faster deploys
+# Cache pip packages for faster redeploys
 [phases.install]
 cacheDirectories = ["/root/.cache/pip"]
 cmds = [
-  "python -m ensurepip",
   "pip install --upgrade pip",
   "pip install --no-cache-dir -r requirements.txt"
 ]
 
-# Optional: build phase if you need precompilation (e.g., xgboost wheels)
 [phases.build]
 cmds = []
 
-# Start FastAPI with Uvicorn on Railway's assigned port
 [start]
 cmd = "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
