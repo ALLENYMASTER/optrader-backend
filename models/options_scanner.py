@@ -56,21 +56,21 @@ class OptionsWhaleScanner:
         return results
     
     def scan_all_parallel(self, tickers: list, max_workers: int = 2) -> list:
-        """Scan tickers in parallel with rate limiting"""
+        """Scan tickers in parallel with aggressive rate limiting"""
         results = []
         
-        # Reduce workers to avoid rate limiting
-        safe_workers = min(max_workers, 3)  # Max 3 concurrent requests
+        # CRITICAL: Reduce to max 2 concurrent requests to avoid 429
+        safe_workers = min(max_workers, 2)
         
         with ThreadPoolExecutor(max_workers=safe_workers) as executor:
             future_to_ticker = {}
             
-            # Submit with delay to avoid rate limiting
+            # Submit with longer delay to avoid rate limiting
             for i, ticker in enumerate(tickers):
-                # Add 200ms delay between submissions
+                # Add 500ms delay between submissions (increased from 200ms)
                 if i > 0:
                     import time
-                    time.sleep(0.2)
+                    time.sleep(0.5)
                 
                 future = executor.submit(self.scan_single_ticker, ticker)
                 future_to_ticker[future] = ticker
@@ -89,17 +89,22 @@ class OptionsWhaleScanner:
         return results
     
     def _get_options_data(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """Fetch comprehensive options data from yfinance with retry logic"""
+        """Fetch comprehensive options data from yfinance with aggressive retry logic"""
         import time
         
         max_retries = 3
-        retry_delay = 2  # seconds
+        base_retry_delay = 3  # Increased from 2 seconds
         
         for attempt in range(max_retries):
             try:
-                # Add small delay to avoid rate limiting
+                # Add longer delay to avoid rate limiting
                 if attempt > 0:
-                    time.sleep(retry_delay * attempt)
+                    delay = base_retry_delay * (attempt + 1)
+                    print(f"⏳ Retrying {ticker} after {delay}s delay...")
+                    time.sleep(delay)
+                
+                # Initial delay before any request
+                time.sleep(0.5)
                 
                 stock = yf.Ticker(ticker)
                 info = stock.info
@@ -113,8 +118,8 @@ class OptionsWhaleScanner:
                 avg_volume = info.get('averageVolume', 1)
                 market_cap = info.get('marketCap', 0)
                 
-                # Add delay before options request
-                time.sleep(0.3)
+                # Add longer delay before options request
+                time.sleep(0.5)
                 
                 expirations = stock.options
                 if not expirations:
@@ -124,14 +129,14 @@ class OptionsWhaleScanner:
                 all_puts = []
                 cutoff_date = datetime.now() + timedelta(days=90)
                 
-                # Fetch first 6 expirations (up to 90 days)
-                for exp_date in expirations[:6]:
+                # Limit to first 4 expirations (reduced from 6)
+                for exp_date in expirations[:4]:
                     exp_datetime = datetime.strptime(exp_date, '%Y-%m-%d')
                     if exp_datetime > cutoff_date:
                         continue
                     
-                    # Add delay between expiration fetches
-                    time.sleep(0.2)
+                    # Add longer delay between expiration fetches
+                    time.sleep(0.5)  # Increased from 0.2s
                     
                     opt_chain = stock.option_chain(exp_date)
                     
@@ -165,7 +170,10 @@ class OptionsWhaleScanner:
                 if "429" in error_msg or "Too Many Requests" in error_msg:
                     print(f"⚠️ Rate limited on {ticker}, attempt {attempt + 1}/{max_retries}")
                     if attempt < max_retries - 1:
-                        time.sleep(retry_delay * (attempt + 2))  # Exponential backoff
+                        # Exponential backoff with longer delays
+                        backoff_delay = base_retry_delay * (2 ** attempt)
+                        print(f"⏳ Backing off for {backoff_delay}s...")
+                        time.sleep(backoff_delay)
                         continue
                 print(f"Error fetching data for {ticker}: {e}")
                 if attempt == max_retries - 1:
@@ -231,11 +239,11 @@ class OptionsWhaleScanner:
                 'strategy_type'
             ] = 'STRADDLE/STRANGLE'
             
-            # Filter unusual activity - RELAXED for testing
+            # Filter unusual activity
             unusual = df[
-                (df['volume'] > 50) &              # Lower from 100
-                (df['total_volume_value'] > 25000) & # Lower from 50000
-                (df['volume_oi_ratio'] > 0.2) &    # Lower from 0.3
+                (df['volume'] > 100) & 
+                (df['total_volume_value'] > 50000) &
+                (df['volume_oi_ratio'] > 0.3) &
                 (df['lastPrice'] > 0.05)
             ].copy()
             
@@ -538,4 +546,4 @@ class OptionsWhaleScanner:
         confidence_order = {'HIGH': 3, 'MEDIUM-HIGH': 2.5, 'MEDIUM': 2, 'LOW-MEDIUM': 1.5, 'LOW': 1}
         recommendations.sort(key=lambda x: confidence_order.get(x['confidence'], 0), reverse=True)
         
-        return recommendations[:3]  # Top 5 strategies
+        return recommendations[:3]  # Top 3 strategies
