@@ -1,10 +1,7 @@
 """
-Enhanced Options Whale Scanner
-Based on us_whale_web.py with full feature set:
-- Expected move calculation (weekly options)
-- Strategy type detection (DIRECTIONAL vs VOLATILITY vs STRADDLE)
-- Enhanced sentiment analysis
-- Multiple strategy recommendations
+Enhanced Options Whale Scanner - FIXED VERSION
+Now returns data even when no unusual activity is detected
+With more lenient whale detection thresholds
 """
 import yfinance as yf
 import pandas as pd
@@ -174,204 +171,193 @@ class OptionsWhaleScanner:
                         backoff_delay = base_retry_delay * (2 ** attempt)
                         print(f"⏳ Backing off for {backoff_delay}s...")
                         time.sleep(backoff_delay)
-                        continue
-                print(f"Error fetching data for {ticker}: {e}")
-                if attempt == max_retries - 1:
-                    return None
+                elif attempt < max_retries - 1:
+                    print(f"⚠️ Error fetching {ticker} data: {e}")
         
         return None
     
     def _identify_whale_activity(self, options_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Identify unusual options activity with enhanced analysis"""
-        if not options_data:
-            return None
-        
+        """
+        Identify whale activity with dynamic thresholds
+        FIXED: Always returns data, even when no whale activity detected
+        """
         ticker = options_data['ticker']
         current_price = options_data['current_price']
         calls = options_data['calls']
         puts = options_data['puts']
         
-        # Calculate expected move for weekly options
-        weekly_options = self._get_weekly_options(calls, puts, current_price)
-        expected_move_data = self._calculate_expected_move(
-            weekly_options['calls'], 
-            weekly_options['puts'], 
-            current_price
-        ) if weekly_options else None
+        # Initialize default response structure
+        default_response = {
+            'ticker': ticker,
+            'current_price': current_price,
+            'volume_ratio': options_data.get('volume_ratio', 0),
+            'market_cap': options_data.get('market_cap', 0),
+            'sentiment': 'NEUTRAL',
+            'sentiment_score': 0,
+            'bullish_percent': 0,
+            'bearish_percent': 0,
+            'total_calls_count': 0,
+            'total_puts_count': 0,
+            'total_calls_value': 0,
+            'total_puts_value': 0,
+            'whale_score': 0,
+            'volatility_plays': 0,
+            'directional_bets': 0,
+            'unusual_activity': [],
+            'expected_move': None,
+            'recommended_strategies': [],
+            'timestamp': datetime.now().isoformat()
+        }
         
-        def find_unusual_activity(df, option_type):
-            """Find unusual trades with enhanced metrics"""
-            if df.empty:
-                return pd.DataFrame()
-            
-            # Enhanced calculations (from us_whale_web.py)
-            df['total_volume_value'] = df['volume'] * df['lastPrice'] * 100
-            df['oi_value'] = df['openInterest'] * df['lastPrice'] * 100
-            df['volume_oi_ratio'] = df['volume'] / (df['openInterest'] + 1)
-            
-            # IV percentile
-            df['iv_percentile'] = df['impliedVolatility'].rank(pct=True)
-            
-            # Moneyness
-            if option_type == 'CALL':
-                df['moneyness'] = df['strike'] / current_price
-            else:
-                df['moneyness'] = current_price / df['strike']
-            
-            # ATM detection
-            df['is_atm'] = (df['strike'] >= current_price * 0.95) & (df['strike'] <= current_price * 1.05)
+        if calls.empty and puts.empty:
+            print(f"ℹ️ {ticker}: No options data available")
+            return default_response
+        
+        # Combine calls and puts
+        all_options = pd.concat([calls, puts], ignore_index=True) if not calls.empty and not puts.empty else (calls if not puts.empty else puts)
+        
+        # Feature engineering
+        all_options['option_type'] = all_options['type'].str.upper()
+        all_options['moneyness'] = all_options.apply(
+            lambda x: (x['strike'] - current_price) / current_price if x['option_type'] == 'CALL'
+            else (current_price - x['strike']) / current_price, axis=1
+        )
+        all_options['dollar_volume'] = all_options['lastPrice'] * all_options['volume'] * 100
+        all_options['notional_value'] = all_options['strike'] * all_options['volume'] * 100
+        all_options['oi_value'] = all_options['lastPrice'] * all_options['openInterest'] * 100
+        all_options['distance_from_price'] = ((all_options['strike'] - current_price) / current_price) * 100
+        
+        # More lenient whale detection criteria (reduced thresholds)
+        # Old: volume > 100 and vol/oi > 0.3
+        # New: volume > 50 and vol/oi > 0.2
+        volume_threshold = 50  # Reduced from 100
+        vol_oi_ratio_threshold = 0.2  # Reduced from 0.3
+        
+        all_options['vol_oi_ratio'] = all_options['volume'] / all_options['openInterest'].replace(0, 1)
+        all_options['is_unusual'] = (
+            (all_options['volume'] > volume_threshold) & 
+            (all_options['vol_oi_ratio'] > vol_oi_ratio_threshold)
+        )
+        
+        # If still no unusual activity with lenient criteria, get top 10 by volume
+        unusual_df = all_options[all_options['is_unusual']].copy()
+        
+        if unusual_df.empty:
+            # Get top 10 most active options as "notable" activity
+            notable_df = all_options.nlargest(10, 'volume').copy()
+            if not notable_df.empty:
+                unusual_df = notable_df
+                print(f"ℹ️ {ticker}: No whale activity detected, showing top {len(notable_df)} active options")
+        
+        # Calculate metrics even with limited data
+        total_calls_vol = calls['volume'].sum() if not calls.empty else 0
+        total_puts_vol = puts['volume'].sum() if not puts.empty else 0
+        total_vol = total_calls_vol + total_puts_vol
+        
+        bullish_percent = (total_calls_vol / total_vol * 100) if total_vol > 0 else 50
+        bearish_percent = (total_puts_vol / total_vol * 100) if total_vol > 0 else 50
+        
+        # Sentiment calculation
+        net_sentiment = bullish_percent - bearish_percent
+        
+        if net_sentiment > 30:
+            sentiment = "STRONG BULLISH"
+            sentiment_score = min(100, 50 + net_sentiment)
+        elif net_sentiment > 10:
+            sentiment = "BULLISH"
+            sentiment_score = 50 + (net_sentiment / 2)
+        elif net_sentiment < -30:
+            sentiment = "STRONG BEARISH"
+            sentiment_score = max(-100, -50 + net_sentiment)
+        elif net_sentiment < -10:
+            sentiment = "BEARISH"
+            sentiment_score = -50 + (net_sentiment / 2)
+        else:
+            sentiment = "NEUTRAL"
+            sentiment_score = net_sentiment
+        
+        # Calculate whale scores and strategy types
+        if not unusual_df.empty:
+            # Whale score calculation
+            unusual_df['whale_score'] = (
+                unusual_df['dollar_volume'] / 10000 * 
+                unusual_df['vol_oi_ratio'] * 
+                (1 + abs(unusual_df['moneyness']))
+            )
             
             # Strategy type detection
-            df['strategy_type'] = 'DIRECTIONAL'
+            unusual_df['strategy_type'] = unusual_df.apply(
+                lambda x: 'DIRECTIONAL' if abs(x['moneyness']) < 0.10
+                else 'VOLATILITY' if 0.10 <= abs(x['moneyness']) < 0.20
+                else 'HEDGE' if abs(x['moneyness']) >= 0.20
+                else 'UNKNOWN', axis=1
+            )
             
-            # High IV + ATM + High volume = Volatility play
-            df.loc[
-                (df['iv_percentile'] > 0.7) & 
-                (df['is_atm']) & 
-                (df['volume_oi_ratio'] > 1.0),
-                'strategy_type'
-            ] = 'VOLATILITY'
+            volatility_plays = len(unusual_df[unusual_df['strategy_type'] == 'VOLATILITY'])
+            directional_bets = len(unusual_df[unusual_df['strategy_type'] == 'DIRECTIONAL'])
             
-            # Straddle/Strangle detection
-            df.loc[
-                (df['is_atm']) & 
-                (df['volume_oi_ratio'] > 2.0),
-                'strategy_type'
-            ] = 'STRADDLE/STRANGLE'
-            
-            # Filter unusual activity
-            unusual = df[
-                (df['volume'] > 100) & 
-                (df['total_volume_value'] > 50000) &
-                (df['volume_oi_ratio'] > 0.3) &
-                (df['lastPrice'] > 0.05)
-            ].copy()
-            
-            if not unusual.empty:
-                unusual['option_type'] = option_type
-                unusual['distance_from_price'] = ((unusual['strike'] - current_price) / current_price * 100).round(2)
-                
-                # Determine likely direction
-                unusual['likely_direction'] = 'UNKNOWN'
-                
-                if option_type == 'CALL':
-                    unusual.loc[(unusual['strike'] < current_price) & (unusual['volume_oi_ratio'] > 1.5), 'likely_direction'] = 'LIKELY SELL'
-                    unusual.loc[(unusual['strike'] >= current_price) & (unusual['volume_oi_ratio'] > 1.5), 'likely_direction'] = 'LIKELY BUY'
-                else:
-                    unusual.loc[(unusual['strike'] > current_price) & (unusual['volume_oi_ratio'] > 1.5), 'likely_direction'] = 'LIKELY SELL'
-                    unusual.loc[(unusual['strike'] <= current_price) & (unusual['volume_oi_ratio'] > 1.5), 'likely_direction'] = 'LIKELY BUY'
-                
-                # Sentiment adjustment
-                if option_type == 'CALL':
-                    unusual['sentiment_adjustment'] = np.where(
-                        unusual['strike'] >= current_price * 0.95,
-                        1.0,
-                        0.3
-                    )
-                else:
-                    unusual['sentiment_adjustment'] = np.where(
-                        unusual['strike'] <= current_price * 1.05,
-                        1.0,
-                        0.3
-                    )
-                
-                # Enhanced whale score
-                unusual['whale_score'] = (
-                    np.log1p(unusual['total_volume_value']) * 0.4 +
-                    unusual['volume_oi_ratio'] * 100 * 0.3 +
-                    unusual['iv_percentile'] * 100 * 0.3
-                ) * unusual['sentiment_adjustment']
-            
-            return unusual
-        
-        unusual_calls = find_unusual_activity(calls, 'CALL')
-        unusual_puts = find_unusual_activity(puts, 'PUT')
-        unusual_activity = pd.concat([unusual_calls, unusual_puts], ignore_index=True)
-        
-        if unusual_activity.empty:
-            return None
-        
-        unusual_activity = unusual_activity.sort_values('whale_score', ascending=False)
-        
-        # Count strategy types
-        volatility_plays = len(unusual_activity[unusual_activity['strategy_type'].str.contains('VOLATILITY|STRADDLE', na=False)])
-        directional_bets = len(unusual_activity[unusual_activity['strategy_type'] == 'DIRECTIONAL'])
-        
-        # Enhanced sentiment calculation
-        likely_buy_calls = unusual_calls[
-            (unusual_calls['likely_direction'] == 'LIKELY BUY') | 
-            (unusual_calls['strike'] >= current_price * 0.95)
-        ] if not unusual_calls.empty else pd.DataFrame()
-        
-        likely_buy_puts = unusual_puts[
-            (unusual_puts['likely_direction'] == 'LIKELY BUY') |
-            (unusual_puts['strike'] <= current_price * 1.05)
-        ] if not unusual_puts.empty else pd.DataFrame()
-        
-        total_calls_value = unusual_calls['total_volume_value'].sum() if not unusual_calls.empty else 0
-        total_puts_value = unusual_puts['total_volume_value'].sum() if not unusual_puts.empty else 0
-        
-        # Weight by whale score and sentiment adjustment
-        weighted_calls = (unusual_calls['whale_score'] * unusual_calls['sentiment_adjustment']).sum() if not unusual_calls.empty else 0
-        weighted_puts = (unusual_puts['whale_score'] * unusual_puts['sentiment_adjustment']).sum() if not unusual_puts.empty else 0
-        total_weighted = weighted_calls + weighted_puts
-        
-        if total_weighted > 0:
-            bullish_pct = (weighted_calls / total_weighted * 100)
-            bearish_pct = (weighted_puts / total_weighted * 100)
+            # Sort by whale score
+            unusual_df = unusual_df.sort_values('whale_score', ascending=False)
+            total_whale_score = unusual_df['whale_score'].sum()
         else:
-            bullish_pct = bearish_pct = 0
+            volatility_plays = 0
+            directional_bets = 0
+            total_whale_score = 0
         
-        # Determine sentiment
-        if bullish_pct > 65:
-            sentiment = 'STRONG BULLISH'
-            sentiment_score = bullish_pct
-        elif bullish_pct > 55:
-            sentiment = 'BULLISH'
-            sentiment_score = bullish_pct
-        elif bearish_pct > 65:
-            sentiment = 'STRONG BEARISH'
-            sentiment_score = -bearish_pct
-        elif bearish_pct > 55:
-            sentiment = 'BEARISH'
-            sentiment_score = -bearish_pct
-        else:
-            sentiment = 'NEUTRAL'
-            sentiment_score = bullish_pct - bearish_pct
+        # Calculate expected move
+        weekly_options = self._get_weekly_options(calls, puts, current_price)
+        expected_move_data = None
+        if weekly_options:
+            expected_move_data = self._calculate_expected_move(
+                weekly_options['calls'], 
+                weekly_options['puts'], 
+                current_price
+            )
         
-        # Generate multiple strategy recommendations
+        # Generate strategy recommendations
         recommended_strategies = self._generate_strategy_recommendations(
-            unusual_activity, sentiment_score, bullish_pct, bearish_pct,
+            unusual_df, sentiment_score, bullish_percent, bearish_percent,
             volatility_plays, directional_bets, expected_move_data, current_price
         )
         
-        # Convert unusual_activity to list of dicts
-        unusual_list = unusual_activity.head(20).to_dict('records')
+        # Convert unusual activity to list of dicts
+        unusual_list = []
+        if not unusual_df.empty:
+            for _, row in unusual_df.head(20).iterrows():  # Top 20 unusual trades
+                unusual_list.append({
+                    'option_type': row['option_type'],
+                    'strike': float(row['strike']),
+                    'expiration': row['expiration'],
+                    'days_to_expiry': int(row['days_to_expiry']),
+                    'volume': int(row['volume']),
+                    'openInterest': int(row['openInterest']),
+                    'vol_oi_ratio': float(row['vol_oi_ratio']),
+                    'lastPrice': float(row['lastPrice']),
+                    'impliedVolatility': float(row.get('impliedVolatility', 0)),
+                    'dollar_volume': float(row['dollar_volume']),
+                    'moneyness': float(row['moneyness']),
+                    'distance_from_price': float(row['distance_from_price']),
+                    'whale_score': float(row.get('whale_score', 0)),
+                    'strategy_type': row.get('strategy_type', 'UNKNOWN')
+                })
         
-        # Clean up numpy types
-        for item in unusual_list:
-            for key, value in item.items():
-                if isinstance(value, (np.integer, np.floating)):
-                    item[key] = float(value) if isinstance(value, np.floating) else int(value)
-                elif pd.isna(value):
-                    item[key] = None
-        
+        # Always return data, even if no unusual activity
         return {
             'ticker': ticker,
-            'current_price': float(current_price),
-            'volume_ratio': float(options_data['volume_ratio']),
-            'market_cap': float(options_data['market_cap']),
+            'current_price': current_price,
+            'volume_ratio': options_data.get('volume_ratio', 0),
+            'market_cap': options_data.get('market_cap', 0),
             'sentiment': sentiment,
             'sentiment_score': float(sentiment_score),
-            'bullish_percent': float(bullish_pct),
-            'bearish_percent': float(bearish_pct),
-            'total_calls_count': len(unusual_calls),
-            'total_puts_count': len(unusual_puts),
-            'total_calls_value': float(total_calls_value),
-            'total_puts_value': float(total_puts_value),
-            'whale_score': float(unusual_activity['whale_score'].max()),
-            'volatility_plays': int(volatility_plays),
-            'directional_bets': int(directional_bets),
+            'bullish_percent': float(bullish_percent),
+            'bearish_percent': float(bearish_percent),
+            'total_calls_count': int(total_calls_vol),
+            'total_puts_count': int(total_puts_vol),
+            'total_calls_value': float(calls['dollar_volume'].sum() if not calls.empty and 'dollar_volume' in calls.columns else 0),
+            'total_puts_value': float(puts['dollar_volume'].sum() if not puts.empty and 'dollar_volume' in puts.columns else 0),
+            'whale_score': float(total_whale_score),
+            'volatility_plays': volatility_plays,
+            'directional_bets': directional_bets,
             'unusual_activity': unusual_list,
             'expected_move': expected_move_data,
             'recommended_strategies': recommended_strategies,
@@ -476,71 +462,105 @@ class OptionsWhaleScanner:
         """Generate multiple trading strategy recommendations"""
         recommendations = []
         
-        if unusual_activity.empty:
-            return recommendations
-        
-        calls = unusual_activity[unusual_activity['option_type'] == 'CALL']
-        puts = unusual_activity[unusual_activity['option_type'] == 'PUT']
-        
-        top_call_strikes = calls.nlargest(3, 'whale_score')['strike'].tolist() if not calls.empty else []
-        top_put_strikes = puts.nlargest(3, 'whale_score')['strike'].tolist() if not puts.empty else []
-        
-        avg_iv = unusual_activity['impliedVolatility'].mean() if not unusual_activity.empty else 0
-        
-        # Strategy 1: Strong Directional
-        if sentiment_score > 65 and directional_bets > volatility_plays * 2:
+        # Always provide at least one basic recommendation based on sentiment
+        if sentiment_score > 20:
             recommendations.append({
-                'strategy': 'BUY CALL DEBIT SPREAD',
-                'confidence': 'HIGH',
-                'rationale': f'Strong bullish sentiment ({bullish_pct:.0f}%) with {directional_bets} directional bets',
-                'suggested_strikes': f'Buy ${top_call_strikes[0]:.0f} / Sell ${top_call_strikes[1]:.0f}' if len(top_call_strikes) >= 2 else 'Buy ATM Call',
+                'strategy': 'BULLISH OUTLOOK - CONSIDER CALLS',
+                'confidence': 'MEDIUM' if sentiment_score > 50 else 'LOW',
+                'rationale': f'Market showing bullish sentiment ({bullish_pct:.0f}%)',
+                'suggested_strikes': 'Consider ATM or slightly OTM calls',
                 'risk_level': 'MEDIUM',
-                'profit_target': f'+{expected_move["expected_move_pct"]:.1f}%' if expected_move else '+5-10%',
-                'stop_loss': '-50% of premium',
-                'time_horizon': '1-4 weeks'
+                'profit_target': '+5-10%',
+                'stop_loss': '-30% of premium',
+                'time_horizon': '2-4 weeks'
+            })
+        elif sentiment_score < -20:
+            recommendations.append({
+                'strategy': 'BEARISH OUTLOOK - CONSIDER PUTS',
+                'confidence': 'MEDIUM' if sentiment_score < -50 else 'LOW',
+                'rationale': f'Market showing bearish sentiment ({bearish_pct:.0f}%)',
+                'suggested_strikes': 'Consider ATM or slightly OTM puts',
+                'risk_level': 'MEDIUM',
+                'profit_target': '-5-10%',
+                'stop_loss': '-30% of premium',
+                'time_horizon': '2-4 weeks'
+            })
+        else:
+            recommendations.append({
+                'strategy': 'NEUTRAL MARKET - CONSIDER RANGE STRATEGIES',
+                'confidence': 'LOW',
+                'rationale': 'Market showing neutral sentiment',
+                'suggested_strikes': 'Consider iron condors or calendar spreads',
+                'risk_level': 'LOW-MEDIUM',
+                'profit_target': 'Collect premium',
+                'stop_loss': 'Exit if price breaks range',
+                'time_horizon': '1-2 weeks'
             })
         
-        elif sentiment_score < -65 and directional_bets > volatility_plays * 2:
-            recommendations.append({
-                'strategy': 'BUY PUT DEBIT SPREAD',
-                'confidence': 'HIGH',
-                'rationale': f'Strong bearish sentiment ({bearish_pct:.0f}%) with {directional_bets} directional bets',
-                'suggested_strikes': f'Buy ${top_put_strikes[0]:.0f} / Sell ${top_put_strikes[1]:.0f}' if len(top_put_strikes) >= 2 else 'Buy ATM Put',
-                'risk_level': 'MEDIUM',
-                'profit_target': f'-{expected_move["expected_move_pct"]:.1f}%' if expected_move else '-5-10%',
-                'stop_loss': '-50% of premium',
-                'time_horizon': '1-4 weeks'
-            })
-        
-        # Strategy 2: High Volatility
-        if volatility_plays >= directional_bets and volatility_plays > 5:
-            if -20 < sentiment_score < 20:
+        # Add more sophisticated strategies if unusual activity exists
+        if not unusual_activity.empty:
+            calls = unusual_activity[unusual_activity['option_type'] == 'CALL']
+            puts = unusual_activity[unusual_activity['option_type'] == 'PUT']
+            
+            top_call_strikes = calls.nlargest(3, 'whale_score')['strike'].tolist() if not calls.empty else []
+            top_put_strikes = puts.nlargest(3, 'whale_score')['strike'].tolist() if not puts.empty else []
+            
+            avg_iv = unusual_activity['impliedVolatility'].mean() if not unusual_activity.empty else 0
+            
+            # Strategy 1: Strong Directional
+            if sentiment_score > 65 and directional_bets > volatility_plays * 2:
                 recommendations.append({
-                    'strategy': 'IRON CONDOR',
+                    'strategy': 'BUY CALL DEBIT SPREAD',
                     'confidence': 'HIGH',
-                    'rationale': f'{volatility_plays} volatility plays with neutral sentiment',
-                    'suggested_strikes': f'Sell ${expected_move["lower_target"]:.0f} Put / ${expected_move["upper_target"]:.0f} Call' if expected_move else 'Sell ±5% wings',
+                    'rationale': f'Strong bullish sentiment ({bullish_pct:.0f}%) with {directional_bets} directional bets',
+                    'suggested_strikes': f'Buy ${top_call_strikes[0]:.0f} / Sell ${top_call_strikes[1]:.0f}' if len(top_call_strikes) >= 2 else 'Buy ATM Call',
                     'risk_level': 'MEDIUM',
-                    'profit_target': '40-60% of max profit',
-                    'stop_loss': 'Exit if price breaks range',
-                    'time_horizon': '1-2 weeks'
+                    'profit_target': f'+{expected_move["expected_move_pct"]:.1f}%' if expected_move else '+5-10%',
+                    'stop_loss': '-50% of premium',
+                    'time_horizon': '1-4 weeks'
                 })
-        
-        # Strategy 3: Follow the Whale
-        if len(unusual_activity) > 0:
-            top_whale_trade = unusual_activity.nlargest(1, 'whale_score').iloc[0]
-            if top_whale_trade['whale_score'] > 200:
-                direction = "BULLISH" if top_whale_trade['option_type'] == 'CALL' else "BEARISH"
+            
+            elif sentiment_score < -65 and directional_bets > volatility_plays * 2:
                 recommendations.append({
-                    'strategy': f'FOLLOW THE WHALE - {"BUY CALL" if direction == "BULLISH" else "BUY PUT"}',
-                    'confidence': 'MEDIUM-HIGH',
-                    'rationale': f'Massive whale trade (Score: {top_whale_trade["whale_score"]:.0f}) at ${top_whale_trade["strike"]:.0f}',
-                    'suggested_strikes': f'${top_whale_trade["strike"]:.0f} {top_whale_trade["option_type"]} exp {top_whale_trade["expiration"]}',
-                    'risk_level': 'HIGH',
-                    'profit_target': f'{top_whale_trade["distance_from_price"]:+.1f}% to strike',
-                    'stop_loss': '-30-50% of premium',
-                    'time_horizon': f'{top_whale_trade["days_to_expiry"]} days'
+                    'strategy': 'BUY PUT DEBIT SPREAD',
+                    'confidence': 'HIGH',
+                    'rationale': f'Strong bearish sentiment ({bearish_pct:.0f}%) with {directional_bets} directional bets',
+                    'suggested_strikes': f'Buy ${top_put_strikes[0]:.0f} / Sell ${top_put_strikes[1]:.0f}' if len(top_put_strikes) >= 2 else 'Buy ATM Put',
+                    'risk_level': 'MEDIUM',
+                    'profit_target': f'-{expected_move["expected_move_pct"]:.1f}%' if expected_move else '-5-10%',
+                    'stop_loss': '-50% of premium',
+                    'time_horizon': '1-4 weeks'
                 })
+            
+            # Strategy 2: High Volatility
+            if volatility_plays >= directional_bets and volatility_plays > 3:  # Reduced from 5
+                if -20 < sentiment_score < 20:
+                    recommendations.append({
+                        'strategy': 'IRON CONDOR',
+                        'confidence': 'MEDIUM-HIGH',
+                        'rationale': f'{volatility_plays} volatility plays with neutral sentiment',
+                        'suggested_strikes': f'Sell ${expected_move["lower_target"]:.0f} Put / ${expected_move["upper_target"]:.0f} Call' if expected_move else 'Sell ±5% wings',
+                        'risk_level': 'MEDIUM',
+                        'profit_target': '40-60% of max profit',
+                        'stop_loss': 'Exit if price breaks range',
+                        'time_horizon': '1-2 weeks'
+                    })
+            
+            # Strategy 3: Follow the Whale
+            if len(unusual_activity) > 0:
+                top_whale_trade = unusual_activity.nlargest(1, 'whale_score').iloc[0]
+                if top_whale_trade['whale_score'] > 100:  # Reduced from 200
+                    direction = "BULLISH" if top_whale_trade['option_type'] == 'CALL' else "BEARISH"
+                    recommendations.append({
+                        'strategy': f'FOLLOW THE WHALE - {"BUY CALL" if direction == "BULLISH" else "BUY PUT"}',
+                        'confidence': 'MEDIUM',
+                        'rationale': f'Notable whale trade (Score: {top_whale_trade["whale_score"]:.0f}) at ${top_whale_trade["strike"]:.0f}',
+                        'suggested_strikes': f'${top_whale_trade["strike"]:.0f} {top_whale_trade["option_type"]} exp {top_whale_trade["expiration"]}',
+                        'risk_level': 'MEDIUM-HIGH',
+                        'profit_target': f'{top_whale_trade["distance_from_price"]:+.1f}% to strike',
+                        'stop_loss': '-30-50% of premium',
+                        'time_horizon': f'{top_whale_trade["days_to_expiry"]} days'
+                    })
         
         # Sort by confidence
         confidence_order = {'HIGH': 3, 'MEDIUM-HIGH': 2.5, 'MEDIUM': 2, 'LOW-MEDIUM': 1.5, 'LOW': 1}
