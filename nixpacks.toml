@@ -1,13 +1,15 @@
-# Full Python + pip environment (no ensurepip needed)
-[phases.setup]
-nixPkgs = ["python3Full"]
+# Explicitly tell Nixpacks to use Python
+[build]
+language = "python"
 
-# Cache pip packages for faster redeploys
+[phases.setup]
+nixPkgs = ["python311Full"]
+
 [phases.install]
 cacheDirectories = ["/root/.cache/pip"]
 cmds = [
-  "pip install --upgrade pip",
-  "pip install --no-cache-dir -r requirements.txt"
+  "python -m pip install --upgrade pip",
+  "python -m pip install --no-cache-dir -r requirements.txt"
 ]
 
 [phases.build]
