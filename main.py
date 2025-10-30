@@ -53,7 +53,7 @@ market_analyzer = MarketAnalyzer()
 
 # Default tickers
 DEFAULT_TICKERS = [
-    "NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "TSM", "IBIT"
+    "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META"
 ]
 
 # ============================================================================
@@ -458,20 +458,32 @@ async def market_status():
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
-    return {
-        "error": exc.detail,
-        "status_code": exc.status_code,
-        "timestamp": datetime.now().isoformat()
-    }
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
+    from fastapi.responses import JSONResponse
     print(f"❌ Unexpected error: {exc}")
-    return {
-        "error": "Internal server error",
-        "status_code": 500,
-        "timestamp": datetime.now().isoformat()
-    }
+    import traceback
+    traceback.print_exc()
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "detail": str(exc),
+            "status_code": 500,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
 
 # ============================================================================
 #  MAIN
