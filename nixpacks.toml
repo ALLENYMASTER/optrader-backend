@@ -2,25 +2,21 @@
 language = "python"
 
 [phases.setup]
-# Provide Python + pip
+# Install Python + pip
 nixPkgs = ["python311Full", "python311Packages.pip", "gcc"]
 
 [phases.install]
 cacheDirectories = ["/root/.cache/pip"]
 cmds = [
-  # Create a writable virtual environment
-  "python -m venv /app/venv",
-  # Activate it
-  ". /app/venv/bin/activate",
-  # Upgrade pip inside venv
-  "pip install --upgrade pip",
-  # Install your dependencies
-  "pip install --no-cache-dir -r requirements.txt"
+  # Create and use a writable venv for pip installs (all in one shell)
+  "python -m venv /app/venv && \
+   /app/venv/bin/pip install --upgrade pip && \
+   /app/venv/bin/pip install --no-cache-dir -r requirements.txt"
 ]
 
 [phases.build]
 cmds = []
 
 [start]
-# Run FastAPI using the virtualenv python
+# Run FastAPI using the venv
 cmd = "/app/venv/bin/uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
