@@ -1,6 +1,6 @@
 # Full Python + pip environment (no ensurepip needed)
 [phases.setup]
-nixPkgs = ["python311Full"]
+nixPkgs = ["python3Full"]
 
 # Cache pip packages for faster redeploys
 [phases.install]
