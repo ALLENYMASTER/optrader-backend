@@ -29,12 +29,12 @@ import time as time_module
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ✅ FIXED: Environment variables with proper defaults and validation
+# Environment variables with proper defaults and validation
 REDIS_URL = os.getenv("REDIS_URL", "redis://default:EfKXKBdmYeyvsDmqcVmurRzMooouZhHO@redis.railway.internal:6379")
 CACHE_TTL = int(os.getenv("CACHE_TTL", "900"))  # 15 minutes
 RATE_LIMIT_DELAY = float(os.getenv("RATE_LIMIT_DELAY", "2"))  # seconds
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
-ALPHA_VANTAGE_KEY = os.getenv("FZXB3UKG8OA3D2P5", "")
+ALPHA_VANTAGE_KEY = os.getenv("T4MFI6GH6275NKLK", "")
 
 # Log configuration on startup
 logger.info(f"🔧 Configuration:")
@@ -112,13 +112,9 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Optrader Backend Starting...")
     logger.info(f"🏢 Environment: {'Production' if os.getenv('RAILWAY_ENVIRONMENT') else 'Development'}")
     
-    # Warm up yfinance connection
-    try:
-        test_ticker = yf.Ticker("SPY")
-        _ = test_ticker.info
-        logger.info("✅ YFinance connection established")
-    except Exception as e:
-        logger.warning(f"⚠️ YFinance warmup failed: {e}")
+    # ✅ REMOVED: Warmup causes immediate rate limiting on startup
+    # YFinance will be initialized on first actual request
+    logger.info("✅ Server ready - YFinance will initialize on first request")
     
     yield
     
@@ -175,10 +171,31 @@ async def clear_memory_cache(key: str, ttl: int):
     if key in memory_cache:
         del memory_cache[key]
 
-# ==================== YFinance Rate Limiting ====================
+# ==================== YFinance Rate Limiting & Session Management ====================
+
+# ✅ ADDED: User-Agent rotation to avoid rate limiting
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
+]
+
+def get_random_headers():
+    """Get random headers to avoid rate limiting"""
+    return {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'max-age=0'
+    }
 
 class RateLimiter:
-    """Simple rate limiter for YFinance API calls"""
+    """Enhanced rate limiter for YFinance API calls"""
     def __init__(self, max_calls_per_minute=20):
         self.max_calls = max_calls_per_minute
         self.calls = []
@@ -192,8 +209,8 @@ class RateLimiter:
             self.calls = [t for t in self.calls if (now - t).seconds < 60]
             
             if len(self.calls) >= self.max_calls:
-                wait_time = 60 - (now - self.calls[0]).seconds
-                logger.warning(f"⏳ Rate limit reached. Waiting {wait_time}s...")
+                wait_time = 60 - (now - self.calls[0]).seconds + random.uniform(1, 3)
+                logger.warning(f"⏳ Rate limit reached. Waiting {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
                 self.calls = []
             
@@ -252,15 +269,45 @@ def get_market_status() -> MarketStatus:
 
 # ==================== Options Analysis ====================
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+# ✅ ADDED: Session pool for yfinance
+import requests
+session_pool = []
+
+def get_yfinance_session():
+    """Get or create a session with random headers"""
+    if not session_pool or random.random() < 0.3:  # 30% chance to create new session
+        session = requests.Session()
+        session.headers.update(get_random_headers())
+        if len(session_pool) < 5:
+            session_pool.append(session)
+        return session
+    return random.choice(session_pool)
+
+@retry(
+    stop=stop_after_attempt(3), 
+    wait=wait_exponential(multiplier=2, min=4, max=30),
+    reraise=True
+)
 def fetch_ticker_data(ticker: str) -> Optional[Dict]:
     """Fetch and analyze options data for a single ticker with retry logic"""
     try:
-        # Rate limiting
-        time_module.sleep(RATE_LIMIT_DELAY)
+        # ✅ ENHANCED: Add random delay to avoid rate limiting
+        delay = RATE_LIMIT_DELAY + random.uniform(0.5, 2.0)
+        time_module.sleep(delay)
         
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        # ✅ ADDED: Use session with random headers
+        session = get_yfinance_session()
+        stock = yf.Ticker(ticker, session=session)
+        
+        # Try to get info with timeout
+        try:
+            info = stock.info
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                logger.warning(f"⏳ {ticker}: Rate limited, will retry...")
+                raise  # Let retry decorator handle it
+            logger.warning(f"⚠️ {ticker}: Info fetch failed: {e}")
+            return None
         
         # Get current price
         current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose', 0)
@@ -273,22 +320,37 @@ def fetch_ticker_data(ticker: str) -> Optional[Dict]:
         avg_volume = info.get('averageVolume', 1)
         market_cap = info.get('marketCap', 0)
         
+        # Add small delay before options fetch
+        time_module.sleep(random.uniform(1, 2))
+        
         # Get options chain
-        expirations = stock.options
+        try:
+            expirations = stock.options
+        except Exception as e:
+            if "429" in str(e):
+                logger.warning(f"⏳ {ticker}: Rate limited on options fetch")
+                raise
+            logger.info(f"ℹ️ {ticker}: No options available")
+            return None
+            
         if not expirations:
             logger.info(f"ℹ️ {ticker}: No options available")
             return None
         
-        # Collect options data (limit to next 90 days)
+        # Collect options data (limit to next 90 days and fewer expirations)
         all_options = []
         cutoff_date = datetime.now() + timedelta(days=90)
         
-        for exp_date in expirations[:6]:  # Limit to first 6 expirations
+        # ✅ REDUCED: Only fetch 3 nearest expirations to reduce API calls
+        for exp_date in expirations[:3]:
             exp_datetime = datetime.strptime(exp_date, '%Y-%m-%d')
             if exp_datetime > cutoff_date:
                 continue
             
             try:
+                # Add delay between expiration fetches
+                time_module.sleep(random.uniform(0.5, 1.5))
+                
                 opt_chain = stock.option_chain(exp_date)
                 
                 # Process calls
@@ -306,6 +368,9 @@ def fetch_ticker_data(ticker: str) -> Optional[Dict]:
                 all_options.append(pd.concat([calls, puts]))
                 
             except Exception as e:
+                if "429" in str(e):
+                    logger.warning(f"⏳ {ticker}: Rate limited on {exp_date}")
+                    raise
                 logger.warning(f"⚠️ {ticker}: Error fetching {exp_date} options: {e}")
                 continue
         
@@ -321,6 +386,9 @@ def fetch_ticker_data(ticker: str) -> Optional[Dict]:
         return analysis
         
     except Exception as e:
+        if "429" in str(e) or "Too Many Requests" in str(e):
+            logger.error(f"🚫 {ticker}: Rate limited - {str(e)}")
+            raise  # Let retry handle it
         logger.error(f"❌ {ticker}: Error - {str(e)}")
         return None
 
@@ -618,6 +686,7 @@ async def scan_market(
         cached = get_cache(f"{SCAN_CACHE_KEY}_{user_id}")
         if cached:
             data = json.loads(cached)
+            logger.info(f"📦 Returning cached results for {user_id}")
             return ScanResponse(**data, from_cache=True)
     
     # Get user's tickers
@@ -627,26 +696,33 @@ async def scan_market(
     # Rate limiting check
     await rate_limiter.acquire()
     
-    # Parallel processing with limited workers
+    # ✅ ENHANCED: Process sequentially with delays to avoid rate limiting
+    # Parallel processing causes too many simultaneous requests
     results = []
-    max_workers = min(max(max_workers, 1), 5)  # Limit between 1-5
-    
-    # Use thread pool for blocking I/O
     loop = asyncio.get_event_loop()
-    futures = []
     
-    for ticker in tickers:
-        future = loop.run_in_executor(executor, fetch_ticker_data, ticker)
-        futures.append(future)
-        
-        # Add delay between submissions to avoid overwhelming API
-        await asyncio.sleep(0.5)
+    for i, ticker in enumerate(tickers):
+        try:
+            # Add progressive delay between tickers
+            if i > 0:
+                delay = 3 + random.uniform(1, 2)  # 3-5 seconds between tickers
+                logger.info(f"⏳ Waiting {delay:.1f}s before {ticker}...")
+                await asyncio.sleep(delay)
+            
+            # Fetch data in executor
+            result = await loop.run_in_executor(executor, fetch_ticker_data, ticker)
+            
+            if result:
+                results.append(result)
+                logger.info(f"✅ {ticker}: Success (whale score: {result['whale_score']:.1f})")
+            else:
+                logger.info(f"⚠️ {ticker}: No data")
+                
+        except Exception as e:
+            logger.error(f"❌ {ticker}: Failed - {e}")
+            continue
     
-    # Gather results
-    ticker_results = await asyncio.gather(*futures)
-    
-    # Filter out None results and sort by whale score
-    results = [r for r in ticker_results if r is not None]
+    # Sort by whale score
     results.sort(key=lambda x: x['whale_score'], reverse=True)
     
     # Create response
