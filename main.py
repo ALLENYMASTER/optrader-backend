@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ==================== Configuration ====================
 
 # ✅ Polygon.io API Key
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "E8RufTcxxWCESJPjjgtIviVNsbnl182n")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "6_nA6udYN7sJ9OXMadp02LjyDX1nAK0m")
 if not POLYGON_API_KEY:
     logger.error("❌ POLYGON_API_KEY not set! Get free key at https://massive.com")
 
