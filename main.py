@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 
 # ✅ 導入 Polygon.io fetcher（替代 yfinance）
-from polygon_data_fetcher import PolygonDataFetcher
+from polygon_fetcher import PolygonDataFetcher
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
