@@ -1,7 +1,5 @@
 """
 Polygon.io Data Fetcher
-替代 yfinance 的數據獲取層
-完全解決 Yahoo Finance rate limiting 問題
 """
 
 from polygon import RESTClient
