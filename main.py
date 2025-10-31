@@ -657,7 +657,7 @@ async def market_status():
 @app.get("/api/scan", response_model=ScanResponse)
 async def scan_market(
     force: bool = False,
-    ignore_hours: bool = False,
+    ignore_hours: bool = True,
     max_workers: int = MAX_WORKERS,
     user_id: str = "default"
 ):
