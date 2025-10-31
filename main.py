@@ -29,26 +29,37 @@ import time as time_module
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Redis configuration
+# ✅ FIXED: Environment variables with proper defaults and validation
 REDIS_URL = os.getenv("REDIS_URL", "redis://default:EfKXKBdmYeyvsDmqcVmurRzMooouZhHO@redis.railway.internal:6379")
-CACHE_TTL = 900  # 15 minutes
+CACHE_TTL = int(os.getenv("CACHE_TTL", "900"))  # 15 minutes
+RATE_LIMIT_DELAY = float(os.getenv("RATE_LIMIT_DELAY", "2"))  # seconds
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
+ALPHA_VANTAGE_KEY = os.getenv("FZXB3UKG8OA3D2P5", "")
+
+# Log configuration on startup
+logger.info(f"🔧 Configuration:")
+logger.info(f"  - Cache TTL: {CACHE_TTL}s")
+logger.info(f"  - Rate Limit Delay: {RATE_LIMIT_DELAY}s")
+logger.info(f"  - Max Workers: {MAX_WORKERS}")
+logger.info(f"  - Redis URL: {REDIS_URL[:20]}..." if REDIS_URL else "  - Redis: Not configured")
+logger.info(f"  - Alpha Vantage: {'Configured ✓' if ALPHA_VANTAGE_KEY else 'Not configured ✗'}")
+
 SCAN_CACHE_KEY = "scan_results"
-RATE_LIMIT_DELAY = 2  # Delay between API calls
 
 # Initialize Redis (optional - will work without it)
 try:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=5)
     redis_client.ping()
     logger.info("✅ Redis connected")
-except:
+except Exception as e:
     redis_client = None
-    logger.warning("⚠️ Redis not available - using in-memory cache")
+    logger.warning(f"⚠️ Redis not available - using in-memory cache: {e}")
 
 # In-memory cache fallback
 memory_cache = {}
 
 # Thread pool for parallel processing
-executor = ThreadPoolExecutor(max_workers=3)
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # ==================== Data Models ====================
 
@@ -99,7 +110,7 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
     # Startup
     logger.info("🚀 Optrader Backend Starting...")
-    logger.info(f"📍 Environment: {'Production' if os.getenv('RAILWAY_ENVIRONMENT') else 'Development'}")
+    logger.info(f"🏢 Environment: {'Production' if os.getenv('RAILWAY_ENVIRONMENT') else 'Development'}")
     
     # Warm up yfinance connection
     try:
@@ -140,8 +151,8 @@ def get_cache(key: str) -> Optional[str]:
     if redis_client:
         try:
             return redis_client.get(key)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Redis get error: {e}")
     return memory_cache.get(key)
 
 def set_cache(key: str, value: str, ttl: int = CACHE_TTL):
@@ -150,8 +161,8 @@ def set_cache(key: str, value: str, ttl: int = CACHE_TTL):
         try:
             redis_client.setex(key, ttl, value)
             return
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Redis set error: {e}")
     
     # Fallback to memory cache
     memory_cache[key] = value
@@ -265,7 +276,7 @@ def fetch_ticker_data(ticker: str) -> Optional[Dict]:
         # Get options chain
         expirations = stock.options
         if not expirations:
-            logger.info(f"⚠️ {ticker}: No options available")
+            logger.info(f"ℹ️ {ticker}: No options available")
             return None
         
         # Collect options data (limit to next 90 days)
@@ -563,7 +574,12 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "cache": "redis" if redis_client else "memory",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "config": {
+            "cache_ttl": CACHE_TTL,
+            "rate_limit_delay": RATE_LIMIT_DELAY,
+            "max_workers": MAX_WORKERS
+        }
     }
 
 @app.get("/api/market-status", response_model=MarketStatus)
@@ -575,7 +591,7 @@ async def market_status():
 async def scan_market(
     force: bool = False,
     ignore_hours: bool = False,
-    max_workers: int = 3,
+    max_workers: int = MAX_WORKERS,
     user_id: str = "default"
 ):
     """
@@ -733,6 +749,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         reload=True if not os.getenv("RAILWAY_ENVIRONMENT") else False,
-        workers=2 if os.getenv("RAILWAY_ENVIRONMENT") else 1
+        workers=1
     )
-
