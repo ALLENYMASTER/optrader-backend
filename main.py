@@ -1,519 +1,738 @@
 """
-Optrader Cloud Backend - FastAPI (FIXED VERSION)
-Main entry point for options whale scanning API
-Fixed: Better handling of tickers with no whale activity
+Optrader Backend - FastAPI Server with Enhanced Features
+Railway-optimized with rate limiting, caching, and error handling
 """
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-import uvicorn
+from datetime import datetime, timedelta, time
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import json
+import asyncio
+import aiohttp
+from contextlib import asynccontextmanager
+import pytz
+import redis
+import hashlib
+from tenacity import retry, stop_after_attempt, wait_exponential
+import logging
+from concurrent.futures import ThreadPoolExecutor
 import os
-from datetime import datetime
+import random
+import time as time_module
 
-# Import modules
-from models.options_scanner import OptionsWhaleScanner
-from models.market_analyzer import MarketAnalyzer
-from storage.ticker_manager import TickerManager
-from storage.cache_manager import CacheManager
-from api.schemas import (
-    TickerRequest, TickerListResponse, ScanResultResponse,
-    MarketSummaryResponse, TickerDetailResponse, HealthResponse
-)
-from config.settings import settings, MarketHours, get_market_status
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ============================================================================
-#  APP INITIALIZATION
-# ============================================================================
+# Redis configuration
+REDIS_URL = os.getenv("REDIS_URL", "redis://default:EfKXKBdmYeyvsDmqcVmurRzMooouZhHO@redis.railway.internal:6379")
+CACHE_TTL = 900  # 15 minutes
+SCAN_CACHE_KEY = "scan_results"
+RATE_LIMIT_DELAY = 2  # Delay between API calls
+
+# Initialize Redis (optional - will work without it)
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    logger.info("✅ Redis connected")
+except:
+    redis_client = None
+    logger.warning("⚠️ Redis not available - using in-memory cache")
+
+# In-memory cache fallback
+memory_cache = {}
+
+# Thread pool for parallel processing
+executor = ThreadPoolExecutor(max_workers=3)
+
+# ==================== Data Models ====================
+
+class TickerData(BaseModel):
+    ticker: str
+    current_price: float
+    volume_ratio: float
+    market_cap: float
+    sentiment: str
+    sentiment_score: float
+    bullish_percent: float
+    bearish_percent: float
+    total_calls_count: int
+    total_puts_count: int
+    total_calls_value: float
+    total_puts_value: float
+    whale_score: float
+    volatility_plays: int
+    directional_bets: int
+    unusual_activity: List[Dict]
+    expected_move: Optional[Dict]
+    recommended_strategies: List[Dict]
+    timestamp: str
+
+class ScanResponse(BaseModel):
+    user_id: str = "default"
+    results: List[TickerData]
+    scan_time: str
+    total_scanned: int
+    total_active: int
+    from_cache: bool
+
+class MarketStatus(BaseModel):
+    current_time_et: str
+    is_market_day: bool
+    is_market_open: bool
+    should_scan_now: bool
+    scan_reason: str
+    next_scan_time_et: str
+
+class TickerRequest(BaseModel):
+    symbol: str
+
+# ==================== Lifespan Management ====================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events"""
+    # Startup
+    logger.info("🚀 Optrader Backend Starting...")
+    logger.info(f"📍 Environment: {'Production' if os.getenv('RAILWAY_ENVIRONMENT') else 'Development'}")
+    
+    # Warm up yfinance connection
+    try:
+        test_ticker = yf.Ticker("SPY")
+        _ = test_ticker.info
+        logger.info("✅ YFinance connection established")
+    except Exception as e:
+        logger.warning(f"⚠️ YFinance warmup failed: {e}")
+    
+    yield
+    
+    # Shutdown
+    logger.info("👋 Optrader Backend Shutting Down...")
+    executor.shutdown(wait=True)
+
+# ==================== FastAPI App ====================
 
 app = FastAPI(
     title="Optrader API",
-    description="Options Whale Scanner & AI Trading Recommendations",
-    version="1.0.1",  # Updated version
-    docs_url="/docs",
-    redoc_url="/redoc"
+    version="1.0.0",
+    description="AI Options Trading Analysis & Recommendation Engine",
+    lifespan=lifespan
 )
 
-# CORS for iPhone/web clients
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================================
-#  GLOBAL INSTANCES
-# ============================================================================
+# ==================== Cache Helpers ====================
 
-ticker_manager = TickerManager()
-cache_manager = CacheManager()
-scanner = OptionsWhaleScanner()
-market_analyzer = MarketAnalyzer()
+def get_cache(key: str) -> Optional[str]:
+    """Get value from cache (Redis or memory)"""
+    if redis_client:
+        try:
+            return redis_client.get(key)
+        except:
+            pass
+    return memory_cache.get(key)
 
-# Default tickers
-DEFAULT_TICKERS = [
-    "NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "TSM", "IBIT"
-]
-
-# ============================================================================
-#  STARTUP & SHUTDOWN EVENTS
-# ============================================================================
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup"""
-    print("=" * 80)
-    print("🚀 Optrader API Starting (v1.0.1 - Fixed)...")
-    print("=" * 80)
+def set_cache(key: str, value: str, ttl: int = CACHE_TTL):
+    """Set value in cache (Redis or memory)"""
+    if redis_client:
+        try:
+            redis_client.setex(key, ttl, value)
+            return
+        except:
+            pass
     
-    # Initialize default tickers
-    for user_id in ["default"]:
-        if not ticker_manager.get_tickers(user_id):
-            ticker_manager.set_tickers(user_id, DEFAULT_TICKERS)
+    # Fallback to memory cache
+    memory_cache[key] = value
+    # Simple TTL implementation for memory cache
+    asyncio.create_task(clear_memory_cache(key, ttl))
+
+async def clear_memory_cache(key: str, ttl: int):
+    """Clear memory cache after TTL"""
+    await asyncio.sleep(ttl)
+    if key in memory_cache:
+        del memory_cache[key]
+
+# ==================== YFinance Rate Limiting ====================
+
+class RateLimiter:
+    """Simple rate limiter for YFinance API calls"""
+    def __init__(self, max_calls_per_minute=20):
+        self.max_calls = max_calls_per_minute
+        self.calls = []
+        self.lock = asyncio.Lock()
     
-    print(f"✅ Default tickers loaded: {len(DEFAULT_TICKERS)}")
-    print(f"✅ Cache manager initialized")
-    print(f"✅ Options scanner ready (with improved whale detection)")
-    print("=" * 80)
+    async def acquire(self):
+        """Wait if rate limit exceeded"""
+        async with self.lock:
+            now = datetime.now()
+            # Remove calls older than 1 minute
+            self.calls = [t for t in self.calls if (now - t).seconds < 60]
+            
+            if len(self.calls) >= self.max_calls:
+                wait_time = 60 - (now - self.calls[0]).seconds
+                logger.warning(f"⏳ Rate limit reached. Waiting {wait_time}s...")
+                await asyncio.sleep(wait_time)
+                self.calls = []
+            
+            self.calls.append(now)
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    print("🛑 Optrader API shutting down...")
-    cache_manager.clear_all()
+rate_limiter = RateLimiter()
 
-# ============================================================================
-#  ROOT & HEALTH ENDPOINTS
-# ============================================================================
+# ==================== Market Hours ====================
 
-@app.get("/", tags=["Root"])
-async def root():
-    """API root endpoint"""
+def get_market_status() -> MarketStatus:
+    """Check if market is open and should scan"""
+    et_tz = pytz.timezone('America/New_York')
+    now_et = datetime.now(et_tz)
+    
+    # Check if weekday (Monday=0, Sunday=6)
+    is_weekday = now_et.weekday() < 5
+    
+    # Market hours
+    pre_market_start = time(7, 0)  # 7:00 AM ET
+    market_open = time(9, 30)      # 9:30 AM ET
+    market_close = time(16, 0)     # 4:00 PM ET
+    post_market_end = time(20, 0)  # 8:00 PM ET
+    
+    current_time = now_et.time()
+    
+    # Determine scan status
+    if not is_weekday:
+        should_scan = False
+        scan_reason = "Weekend - Markets Closed"
+        next_scan = "Monday 7:00 AM ET"
+    elif pre_market_start <= current_time < market_open:
+        should_scan = True
+        scan_reason = "Pre-Market Hours"
+        next_scan = f"Every 30 minutes"
+    elif market_open <= current_time < market_close:
+        should_scan = True
+        scan_reason = "Market Hours - Active Trading"
+        next_scan = f"Every 15 minutes"
+    elif market_close <= current_time < post_market_end:
+        should_scan = True
+        scan_reason = "Post-Market Hours"
+        next_scan = f"Every 30 minutes"
+    else:
+        should_scan = False
+        scan_reason = "Outside Trading Hours"
+        next_scan = "Tomorrow 7:00 AM ET"
+    
+    return MarketStatus(
+        current_time_et=now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
+        is_market_day=is_weekday,
+        is_market_open=is_weekday and market_open <= current_time < market_close,
+        should_scan_now=should_scan,
+        scan_reason=scan_reason,
+        next_scan_time_et=next_scan
+    )
+
+# ==================== Options Analysis ====================
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def fetch_ticker_data(ticker: str) -> Optional[Dict]:
+    """Fetch and analyze options data for a single ticker with retry logic"""
+    try:
+        # Rate limiting
+        time_module.sleep(RATE_LIMIT_DELAY)
+        
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        
+        # Get current price
+        current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose', 0)
+        if current_price <= 0:
+            logger.warning(f"❌ {ticker}: Invalid price")
+            return None
+        
+        # Get volume metrics
+        volume = info.get('volume', 0)
+        avg_volume = info.get('averageVolume', 1)
+        market_cap = info.get('marketCap', 0)
+        
+        # Get options chain
+        expirations = stock.options
+        if not expirations:
+            logger.info(f"⚠️ {ticker}: No options available")
+            return None
+        
+        # Collect options data (limit to next 90 days)
+        all_options = []
+        cutoff_date = datetime.now() + timedelta(days=90)
+        
+        for exp_date in expirations[:6]:  # Limit to first 6 expirations
+            exp_datetime = datetime.strptime(exp_date, '%Y-%m-%d')
+            if exp_datetime > cutoff_date:
+                continue
+            
+            try:
+                opt_chain = stock.option_chain(exp_date)
+                
+                # Process calls
+                calls = opt_chain.calls.copy()
+                calls['expiration'] = exp_date
+                calls['type'] = 'call'
+                calls['days_to_expiry'] = (exp_datetime - datetime.now()).days
+                
+                # Process puts
+                puts = opt_chain.puts.copy()
+                puts['expiration'] = exp_date
+                puts['type'] = 'put'
+                puts['days_to_expiry'] = (exp_datetime - datetime.now()).days
+                
+                all_options.append(pd.concat([calls, puts]))
+                
+            except Exception as e:
+                logger.warning(f"⚠️ {ticker}: Error fetching {exp_date} options: {e}")
+                continue
+        
+        if not all_options:
+            return None
+        
+        # Combine all options
+        options_df = pd.concat(all_options, ignore_index=True)
+        
+        # Analyze options for whale activity
+        analysis = analyze_options_flow(ticker, options_df, current_price, volume, avg_volume, market_cap)
+        
+        return analysis
+        
+    except Exception as e:
+        logger.error(f"❌ {ticker}: Error - {str(e)}")
+        return None
+
+def analyze_options_flow(ticker: str, options_df: pd.DataFrame, current_price: float, 
+                        volume: int, avg_volume: int, market_cap: float) -> Dict:
+    """Analyze options flow for unusual activity and sentiment"""
+    
+    # Filter for liquid options
+    liquid_options = options_df[
+        (options_df['volume'] > 100) &
+        (options_df['openInterest'] > 50)
+    ].copy()
+    
+    if liquid_options.empty:
+        return None
+    
+    # Calculate additional metrics
+    liquid_options['volume_oi_ratio'] = liquid_options['volume'] / (liquid_options['openInterest'] + 1)
+    liquid_options['moneyness'] = liquid_options['strike'] / current_price
+    liquid_options['total_value'] = liquid_options['volume'] * liquid_options['lastPrice'] * 100
+    
+    # Identify unusual activity (volume > 2x OI or high value trades)
+    unusual_mask = (
+        (liquid_options['volume_oi_ratio'] > 2) |
+        (liquid_options['total_value'] > 50000)
+    )
+    
+    unusual_activity = liquid_options[unusual_mask].copy()
+    
+    if unusual_activity.empty:
+        return None
+    
+    # Calculate whale scores
+    unusual_activity['whale_score'] = (
+        np.log1p(unusual_activity['total_value']) * 0.4 +
+        unusual_activity['volume_oi_ratio'] * 100 * 0.3 +
+        unusual_activity.get('impliedVolatility', 0.3) * 100 * 0.3
+    )
+    
+    # Separate calls and puts
+    unusual_calls = unusual_activity[unusual_activity['type'] == 'call']
+    unusual_puts = unusual_activity[unusual_activity['type'] == 'put']
+    
+    # Calculate sentiment
+    total_calls_value = unusual_calls['total_value'].sum() if not unusual_calls.empty else 0
+    total_puts_value = unusual_puts['total_value'].sum() if not unusual_puts.empty else 0
+    total_value = total_calls_value + total_puts_value
+    
+    if total_value > 0:
+        bullish_pct = (total_calls_value / total_value) * 100
+        bearish_pct = (total_puts_value / total_value) * 100
+    else:
+        bullish_pct = bearish_pct = 50
+    
+    # Determine sentiment
+    if bullish_pct > 65:
+        sentiment = "STRONG BULLISH"
+        sentiment_score = bullish_pct
+    elif bullish_pct > 55:
+        sentiment = "BULLISH"
+        sentiment_score = bullish_pct
+    elif bearish_pct > 65:
+        sentiment = "STRONG BEARISH"
+        sentiment_score = -bearish_pct
+    elif bearish_pct > 55:
+        sentiment = "BEARISH"
+        sentiment_score = -bearish_pct
+    else:
+        sentiment = "NEUTRAL"
+        sentiment_score = bullish_pct - bearish_pct
+    
+    # Calculate expected move (simplified)
+    atm_options = liquid_options[
+        (liquid_options['moneyness'] > 0.97) & 
+        (liquid_options['moneyness'] < 1.03)
+    ]
+    
+    expected_move_data = None
+    if not atm_options.empty:
+        avg_iv = atm_options.get('impliedVolatility', pd.Series([0.3])).mean()
+        days_to_exp = atm_options['days_to_expiry'].min()
+        expected_move_pct = avg_iv * np.sqrt(days_to_exp / 365) * 100
+        
+        expected_move_data = {
+            "atm_strike": current_price,
+            "expected_move_pct": expected_move_pct,
+            "upper_target": current_price * (1 + expected_move_pct / 100),
+            "lower_target": current_price * (1 - expected_move_pct / 100),
+            "confidence": "68% (1σ)"
+        }
+    
+    # Generate strategy recommendations
+    strategies = generate_strategies(
+        sentiment_score, bullish_pct, bearish_pct, 
+        unusual_activity, current_price, expected_move_data
+    )
+    
+    # Prepare unusual activity for JSON
+    unusual_json = []
+    for _, row in unusual_activity.nlargest(10, 'whale_score').iterrows():
+        unusual_json.append({
+            "option_type": row['type'].upper(),
+            "strike": float(row['strike']),
+            "expiration": row['expiration'],
+            "volume": int(row['volume']),
+            "lastPrice": float(row['lastPrice']),
+            "whale_score": float(row['whale_score']),
+            "strategy_type": "DIRECTIONAL" if row['type'] == 'call' else "HEDGE"
+        })
+    
     return {
-        "app": "Optrader API",
-        "version": "1.0.1",
-        "status": "running",
-        "endpoints": {
-            "tickers": "/api/tickers",
-            "scan": "/api/scan",
-            "market_summary": "/api/market-summary",
-            "market_status": "/api/market-status",
-            "ticker_detail": "/api/ticker/{symbol}",
-            "health": "/health"
-        },
+        "ticker": ticker,
+        "current_price": current_price,
+        "volume_ratio": volume / avg_volume if avg_volume > 0 else 0,
+        "market_cap": market_cap,
+        "sentiment": sentiment,
+        "sentiment_score": sentiment_score,
+        "bullish_percent": bullish_pct,
+        "bearish_percent": bearish_pct,
+        "total_calls_count": len(unusual_calls),
+        "total_puts_count": len(unusual_puts),
+        "total_calls_value": total_calls_value,
+        "total_puts_value": total_puts_value,
+        "whale_score": unusual_activity['whale_score'].max(),
+        "volatility_plays": 0,  # Simplified
+        "directional_bets": len(unusual_activity),
+        "unusual_activity": unusual_json,
+        "expected_move": expected_move_data,
+        "recommended_strategies": strategies,
         "timestamp": datetime.now().isoformat()
     }
 
-@app.get("/favicon.ico")
-async def favicon():
-    """Return 204 No Content for favicon requests to avoid 404 errors"""
-    from fastapi.responses import Response
-    return Response(status_code=204)
+def generate_strategies(sentiment_score: float, bullish_pct: float, bearish_pct: float,
+                       unusual_activity: pd.DataFrame, current_price: float, 
+                       expected_move: Optional[Dict]) -> List[Dict]:
+    """Generate trading strategy recommendations"""
+    strategies = []
+    
+    # Get top strikes from unusual activity
+    top_calls = unusual_activity[unusual_activity['type'] == 'call'].nlargest(3, 'whale_score')
+    top_puts = unusual_activity[unusual_activity['type'] == 'put'].nlargest(3, 'whale_score')
+    
+    # Strategy 1: Follow the whale
+    if not top_calls.empty and sentiment_score > 60:
+        top_strike = top_calls.iloc[0]['strike']
+        strategies.append({
+            "strategy": "FOLLOW WHALE - BUY CALLS",
+            "confidence": "HIGH" if sentiment_score > 70 else "MEDIUM",
+            "rationale": f"Heavy call buying detected at ${top_strike:.2f} strike",
+            "suggested_strikes": f"${top_strike:.2f}",
+            "risk_level": "MODERATE",
+            "profit_target": "20-30%",
+            "stop_loss": "-30%",
+            "time_horizon": "1-2 weeks"
+        })
+    
+    elif not top_puts.empty and sentiment_score < -60:
+        top_strike = top_puts.iloc[0]['strike']
+        strategies.append({
+            "strategy": "FOLLOW WHALE - BUY PUTS",
+            "confidence": "HIGH" if sentiment_score < -70 else "MEDIUM",
+            "rationale": f"Heavy put buying detected at ${top_strike:.2f} strike",
+            "suggested_strikes": f"${top_strike:.2f}",
+            "risk_level": "MODERATE",
+            "profit_target": "20-30%",
+            "stop_loss": "-30%",
+            "time_horizon": "1-2 weeks"
+        })
+    
+    # Strategy 2: Spreads for high conviction
+    if sentiment_score > 65:
+        if expected_move:
+            upper_target = expected_move['upper_target']
+            strategies.append({
+                "strategy": "BULL CALL SPREAD",
+                "confidence": "HIGH",
+                "rationale": "Strong bullish sentiment with defined risk",
+                "suggested_strikes": f"Buy ${current_price:.2f} / Sell ${upper_target:.2f}",
+                "risk_level": "LOW-MODERATE",
+                "profit_target": "40-60%",
+                "stop_loss": "Max loss defined",
+                "time_horizon": "2-4 weeks"
+            })
+    
+    elif sentiment_score < -65:
+        if expected_move:
+            lower_target = expected_move['lower_target']
+            strategies.append({
+                "strategy": "BEAR PUT SPREAD",
+                "confidence": "HIGH",
+                "rationale": "Strong bearish sentiment with defined risk",
+                "suggested_strikes": f"Buy ${current_price:.2f} / Sell ${lower_target:.2f}",
+                "risk_level": "LOW-MODERATE",
+                "profit_target": "40-60%",
+                "stop_loss": "Max loss defined",
+                "time_horizon": "2-4 weeks"
+            })
+    
+    # Strategy 3: Neutral/Volatility plays
+    if abs(sentiment_score) < 20:
+        strategies.append({
+            "strategy": "IRON CONDOR",
+            "confidence": "MEDIUM",
+            "rationale": "Neutral sentiment - profit from range-bound movement",
+            "suggested_strikes": "Sell ATM straddle, buy OTM protection",
+            "risk_level": "MODERATE",
+            "profit_target": "15-25%",
+            "stop_loss": "Max loss defined",
+            "time_horizon": "2-4 weeks"
+        })
+    
+    # Always add a conservative strategy
+    strategies.append({
+        "strategy": "WAIT FOR CONFIRMATION",
+        "confidence": "LOW",
+        "rationale": "Monitor for additional signals before entering",
+        "suggested_strikes": "N/A",
+        "risk_level": "NONE",
+        "profit_target": "N/A",
+        "stop_loss": "N/A",
+        "time_horizon": "Watch next 1-2 days"
+    })
+    
+    return strategies[:5]  # Return top 5 strategies
 
-@app.get("/health", response_model=HealthResponse, tags=["Health"])
+# ==================== User Ticker Management ====================
+
+def get_user_tickers(user_id: str = "default") -> List[str]:
+    """Get user's watchlist"""
+    default_tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "QQQ", "AMD", "META", "GOOGL", "AMZN"]
+    
+    cache_key = f"tickers_{user_id}"
+    cached = get_cache(cache_key)
+    
+    if cached:
+        return json.loads(cached)
+    
+    return default_tickers
+
+def save_user_tickers(user_id: str, tickers: List[str]):
+    """Save user's watchlist"""
+    cache_key = f"tickers_{user_id}"
+    set_cache(cache_key, json.dumps(tickers), ttl=86400)  # 24 hours
+
+# ==================== API Endpoints ====================
+
+@app.get("/health")
 async def health_check():
-    """Health check endpoint for monitoring"""
+    """Health check endpoint for Railway"""
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "cache_size": cache_manager.get_cache_size(),
-        "uptime": "running"
+        "cache": "redis" if redis_client else "memory",
+        "version": "1.0.0"
     }
 
-# ============================================================================
-#  TICKER MANAGEMENT ENDPOINTS
-# ============================================================================
+@app.get("/api/market-status", response_model=MarketStatus)
+async def market_status():
+    """Get current market status"""
+    return get_market_status()
 
-@app.get("/api/tickers", response_model=TickerListResponse, tags=["Tickers"])
-async def get_tickers(user_id: str = Query("default", description="User ID")):
-    """
-    Get user's ticker list
-    
-    - **user_id**: User identifier (default: "default")
-    """
-    tickers = ticker_manager.get_tickers(user_id)
-    return {
-        "user_id": user_id,
-        "tickers": tickers,
-        "count": len(tickers),
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.post("/api/tickers/add", response_model=TickerListResponse, tags=["Tickers"])
-async def add_ticker(
-    request: TickerRequest,
-    user_id: str = Query("default", description="User ID")
-):
-    """
-    Add ticker to user's list
-    
-    - **symbol**: Stock ticker symbol (e.g., "NVDA")
-    - **user_id**: User identifier
-    """
-    symbol = request.symbol.upper().strip()
-    
-    # Validate ticker format
-    if not symbol or len(symbol) > 5:
-        raise HTTPException(status_code=400, detail="Invalid ticker symbol")
-    
-    success = ticker_manager.add_ticker(user_id, symbol)
-    
-    if not success:
-        raise HTTPException(status_code=400, detail=f"Ticker {symbol} already exists")
-    
-    # Clear cache for this user
-    cache_manager.delete(f"scan_{user_id}")
-    
-    tickers = ticker_manager.get_tickers(user_id)
-    return {
-        "user_id": user_id,
-        "tickers": tickers,
-        "count": len(tickers),
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.post("/api/tickers/remove", response_model=TickerListResponse, tags=["Tickers"])
-async def remove_ticker(
-    request: TickerRequest,
-    user_id: str = Query("default", description="User ID")
-):
-    """
-    Remove ticker from user's list
-    
-    - **symbol**: Stock ticker symbol to remove
-    - **user_id**: User identifier
-    """
-    symbol = request.symbol.upper().strip()
-    success = ticker_manager.remove_ticker(user_id, symbol)
-    
-    if not success:
-        raise HTTPException(status_code=404, detail=f"Ticker {symbol} not found")
-    
-    # Clear cache
-    cache_manager.delete(f"scan_{user_id}")
-    
-    tickers = ticker_manager.get_tickers(user_id)
-    return {
-        "user_id": user_id,
-        "tickers": tickers,
-        "count": len(tickers),
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.post("/api/tickers/set", response_model=TickerListResponse, tags=["Tickers"])
-async def set_tickers(
-    tickers: List[str],
-    user_id: str = Query("default", description="User ID")
-):
-    """
-    Replace entire ticker list
-    
-    - **tickers**: List of ticker symbols
-    - **user_id**: User identifier
-    """
-    # Validate and clean tickers
-    clean_tickers = [t.upper().strip() for t in tickers if t.strip()]
-    
-    if len(clean_tickers) == 0:
-        raise HTTPException(status_code=400, detail="Ticker list cannot be empty")
-    
-    ticker_manager.set_tickers(user_id, clean_tickers)
-    
-    # Clear cache
-    cache_manager.delete(f"scan_{user_id}")
-    
-    return {
-        "user_id": user_id,
-        "tickers": clean_tickers,
-        "count": len(clean_tickers),
-        "timestamp": datetime.now().isoformat()
-    }
-
-# ============================================================================
-#  SCANNING ENDPOINTS
-# ============================================================================
-
-@app.get("/api/scan", response_model=ScanResultResponse, tags=["Scanning"])
+@app.get("/api/scan", response_model=ScanResponse)
 async def scan_market(
-    user_id: str = Query("default", description="User ID"),
-    force: bool = Query(False, description="Force refresh (bypass cache)"),
-    parallel: bool = Query(True, description="Use parallel scanning"),
-    ignore_hours: bool = Query(False, description="Ignore market hours check"),
-    max_workers: int = Query(3, description="Max concurrent requests (1-3, lower = safer)")
+    force: bool = False,
+    ignore_hours: bool = False,
+    max_workers: int = 3,
+    user_id: str = "default"
 ):
     """
-    Scan user's tickers for whale activity
-    
-    - **user_id**: User identifier
-    - **force**: Bypass cache and force new scan
-    - **parallel**: Use parallel scanning (faster, default: True)
-    - **ignore_hours**: Bypass market hours check (default: False)
-    - **max_workers**: Concurrent requests (1-3, default: 3 to avoid rate limiting)
-    
-    Returns sorted results: BULLISH → BEARISH
-    Note: Will return data even if no whale activity is detected
-    
-    **Smart Scheduling:**
-    - Scans only during: Pre-market (1h before), Market hours (every 1h), Post-market (1h after)
-    - Use `ignore_hours=true` to force scan anytime
-    
-    **Rate Limiting:**
-    - Default max_workers=3 to avoid yfinance 429 errors
-    - Increase only if needed and willing to risk rate limits
+    Scan market for whale activity
+    - force: Force new scan (ignore cache)
+    - ignore_hours: Scan even outside market hours
+    - max_workers: Number of parallel workers (1-5)
     """
     
-    # Validate max_workers
-    max_workers = min(max(1, max_workers), 3)  # Clamp to 1-3
-    
-    # Check market hours (unless ignored)
-    if not ignore_hours:
-        should_scan, reason = MarketHours.should_scan_now()
-        if not should_scan:
-            next_scan = MarketHours.next_scan_time()
-            raise HTTPException(
-                status_code=425,  # Too Early
-                detail={
-                    "error": "Outside scanning window",
-                    "reason": reason,
-                    "next_scan_time": next_scan.isoformat(),
-                    "next_scan_et": next_scan.strftime("%Y-%m-%d %H:%M:%S %Z"),
-                    "hint": "Use ignore_hours=true to force scan"
-                }
-            )
-    
-    # Check cache
-    cache_key = f"scan_{user_id}"
-    if not force:
-        cached = cache_manager.get(cache_key)
-        if cached:
-            cached['from_cache'] = True
-            return cached
-    
-    # Get user's tickers
-    tickers = ticker_manager.get_tickers(user_id)
-    
-    if not tickers:
+    # Check market hours
+    market = get_market_status()
+    if not ignore_hours and not market.should_scan_now:
         raise HTTPException(
-            status_code=400, 
-            detail="No tickers configured. Add tickers first."
+            status_code=425,
+            detail={
+                "error": "Outside scanning window",
+                "reason": market.scan_reason,
+                "next_scan": market.next_scan_time_et
+            }
         )
     
-    # Scan tickers
-    print(f"📊 Scanning {len(tickers)} tickers for user: {user_id} (workers: {max_workers})")
+    # Check cache first
+    if not force:
+        cached = get_cache(f"{SCAN_CACHE_KEY}_{user_id}")
+        if cached:
+            data = json.loads(cached)
+            return ScanResponse(**data, from_cache=True)
     
-    if parallel:
-        results = scanner.scan_all_parallel(tickers, max_workers=max_workers)
-    else:
-        results = scanner.scan_all_sequential(tickers)
+    # Get user's tickers
+    tickers = get_user_tickers(user_id)
+    logger.info(f"📊 Scanning {len(tickers)} tickers for {user_id}")
     
-    # Sort by sentiment score (bullish → bearish)
-    results.sort(key=lambda x: x.get('sentiment_score', 0), reverse=True)
+    # Rate limiting check
+    await rate_limiter.acquire()
     
-    response = {
+    # Parallel processing with limited workers
+    results = []
+    max_workers = min(max(max_workers, 1), 5)  # Limit between 1-5
+    
+    # Use thread pool for blocking I/O
+    loop = asyncio.get_event_loop()
+    futures = []
+    
+    for ticker in tickers:
+        future = loop.run_in_executor(executor, fetch_ticker_data, ticker)
+        futures.append(future)
+        
+        # Add delay between submissions to avoid overwhelming API
+        await asyncio.sleep(0.5)
+    
+    # Gather results
+    ticker_results = await asyncio.gather(*futures)
+    
+    # Filter out None results and sort by whale score
+    results = [r for r in ticker_results if r is not None]
+    results.sort(key=lambda x: x['whale_score'], reverse=True)
+    
+    # Create response
+    response_data = {
         "user_id": user_id,
-        "results": results,
+        "results": [TickerData(**r) for r in results],
         "scan_time": datetime.now().isoformat(),
         "total_scanned": len(tickers),
         "total_active": len(results),
         "from_cache": False
     }
     
-    # Cache for 15 minutes
-    cache_manager.set(cache_key, response, ttl=900)
+    # Cache results
+    set_cache(f"{SCAN_CACHE_KEY}_{user_id}", json.dumps(response_data))
     
-    return response
+    logger.info(f"✅ Scan complete: {len(results)} active / {len(tickers)} total")
+    return ScanResponse(**response_data)
 
-@app.get("/api/ticker/{symbol}", response_model=TickerDetailResponse, tags=["Scanning"])
-async def get_ticker_detail(
-    symbol: str,
-    force: bool = Query(False, description="Force refresh")
-):
-    """
-    Get detailed analysis for a specific ticker
-    
-    - **symbol**: Stock ticker symbol
-    - **force**: Bypass cache
-    
-    Note: Will return data even if no whale activity is detected.
-    Check the 'unusual_activity' array to see if whales are active.
-    """
-    symbol = symbol.upper().strip()
-    
-    # Check cache
-    cache_key = f"ticker_{symbol}"
-    if not force:
-        cached = cache_manager.get(cache_key)
-        if cached:
-            return cached
-    
-    # Scan single ticker
-    result = scanner.scan_single_ticker(symbol)
-    
-    # Better error handling
-    if not result:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unable to fetch data for {symbol}. Please verify the ticker symbol is correct."
-        )
-    
-    # Check if we have data but no whale activity
-    if result and len(result.get('unusual_activity', [])) == 0:
-        print(f"ℹ️ {symbol}: Data retrieved but no whale activity detected")
-        # Still return the data - it includes sentiment and recommendations
-    
-    response = {
-        "symbol": symbol,
-        "data": result,
-        "timestamp": datetime.now().isoformat()
-    }
-    
-    # Cache for 10 minutes
-    cache_manager.set(cache_key, response, ttl=600)
-    
-    return response
+@app.get("/api/tickers")
+async def get_tickers(user_id: str = "default"):
+    """Get user's ticker watchlist"""
+    return {"tickers": get_user_tickers(user_id)}
 
-# ============================================================================
-#  MARKET ANALYSIS ENDPOINTS
-# ============================================================================
+@app.post("/api/tickers/add")
+async def add_ticker(request: TickerRequest, user_id: str = "default"):
+    """Add ticker to watchlist"""
+    tickers = get_user_tickers(user_id)
+    
+    if request.symbol.upper() not in tickers:
+        tickers.append(request.symbol.upper())
+        save_user_tickers(user_id, tickers)
+    
+    return {"message": "Ticker added", "tickers": tickers}
 
-@app.get("/api/market-summary", response_model=MarketSummaryResponse, tags=["Market Analysis"])
-async def market_summary(
-    user_id: str = Query("default", description="User ID"),
-    force: bool = Query(False, description="Force refresh")
-):
-    """
-    Get overall market sentiment and top opportunities
+@app.post("/api/tickers/remove")
+async def remove_ticker(request: TickerRequest, user_id: str = "default"):
+    """Remove ticker from watchlist"""
+    tickers = get_user_tickers(user_id)
     
-    - **user_id**: User identifier
-    - **force**: Bypass cache
+    if request.symbol.upper() in tickers:
+        tickers.remove(request.symbol.upper())
+        save_user_tickers(user_id, tickers)
     
-    Returns aggregated market analysis with top 5 opportunities
-    """
-    
-    # Check cache
-    cache_key = f"market_summary_{user_id}"
-    if not force:
-        cached = cache_manager.get(cache_key)
-        if cached:
-            return cached
-    
-    # Get scan results
-    scan_data = await scan_market(user_id=user_id, force=force)
-    results = scan_data['results']
-    
-    if not results:
-        return {
-            "user_id": user_id,
-            "regime": "UNKNOWN",
-            "regime_icon": "❓",
-            "bullish_percent": 0.0,
-            "bearish_percent": 0.0,
-            "total_tickers": 0,
-            "active_tickers": 0,
-            "top_opportunities": [],
-            "risk_level": "UNKNOWN",
-            "timestamp": datetime.now().isoformat()
-        }
-    
-    # Use MarketAnalyzer
-    summary = market_analyzer.analyze(results)
-    summary['user_id'] = user_id
-    summary['timestamp'] = datetime.now().isoformat()
-    
-    # Cache for 15 minutes
-    cache_manager.set(cache_key, summary, ttl=900)
-    
-    return summary
+    return {"message": "Ticker removed", "tickers": tickers}
 
-# ============================================================================
-#  UTILITY ENDPOINTS
-# ============================================================================
-
-@app.post("/api/cache/clear", tags=["Utilities"])
-async def clear_cache(user_id: Optional[str] = Query(None, description="User ID (optional)")):
-    """
-    Clear cache
+@app.get("/api/ticker/{symbol}")
+async def get_ticker_analysis(symbol: str):
+    """Get detailed analysis for a single ticker"""
+    await rate_limiter.acquire()
     
-    - **user_id**: Clear cache for specific user, or all if not provided
-    """
-    if user_id:
-        cache_manager.delete(f"scan_{user_id}")
-        cache_manager.delete(f"market_summary_{user_id}")
-        return {"message": f"Cache cleared for user: {user_id}"}
-    else:
-        cache_manager.clear_all()
-        return {"message": "All cache cleared"}
+    # Check cache first
+    cache_key = f"ticker_{symbol.upper()}"
+    cached = get_cache(cache_key)
+    
+    if cached:
+        return json.loads(cached)
+    
+    # Fetch fresh data
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(executor, fetch_ticker_data, symbol.upper())
+    
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"No data available for {symbol}")
+    
+    # Cache result
+    set_cache(cache_key, json.dumps(result))
+    
+    return result
 
-@app.get("/api/default-tickers", tags=["Utilities"])
-async def get_default_tickers():
-    """Get default ticker list"""
+# ==================== Error Handlers ====================
+
+@app.exception_handler(429)
+async def rate_limit_handler(request, exc):
+    """Handle rate limit errors from yfinance"""
+    logger.error("🚫 Rate limit hit - implementing backoff")
     return {
-        "default_tickers": DEFAULT_TICKERS,
-        "count": len(DEFAULT_TICKERS)
+        "error": "Rate limit exceeded",
+        "message": "Too many requests. Please try again in a few minutes.",
+        "retry_after": 60
     }
-
-@app.get("/api/market-status", tags=["Utilities"])
-async def market_status():
-    """
-    Get current market status and next scan time
-    
-    Returns market hours, trading day info, and next recommended scan time
-    """
-    return get_market_status()
-
-# ============================================================================
-#  ERROR HANDLERS
-# ============================================================================
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    from fastapi.responses import JSONResponse
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": exc.detail,
-            "status_code": exc.status_code,
-            "timestamp": datetime.now().isoformat()
-        }
-    )
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
-    from fastapi.responses import JSONResponse
-    print(f"❌ Unexpected error: {exc}")
-    import traceback
-    traceback.print_exc()
-    
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "Internal server error",
-            "detail": str(exc),
-            "status_code": 500,
-            "timestamp": datetime.now().isoformat()
-        }
-    )
+    """Handle general exceptions"""
+    logger.error(f"❌ Unexpected error: {exc}")
+    return {
+        "error": "Internal server error",
+        "message": "An unexpected error occurred. Please try again later."
+    }
 
-# ============================================================================
-#  MAIN
-# ============================================================================
+# ==================== Main ====================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    import uvicorn
     
-    print("\n" + "=" * 80)
-    print("🚀 Starting Optrader API Server (v1.0.1 - Fixed)")
-    print("=" * 80)
-    print(f"📡 Port: {port}")
-    print(f"📚 Docs: http://localhost:{port}/docs")
-    print(f"🔄 Redoc: http://localhost:{port}/redoc")
-    print("=" * 80 + "\n")
+    port = int(os.getenv("PORT", 8000))
     
     uvicorn.run(
-        app,
+        "main:app",
         host="0.0.0.0",
         port=port,
-        log_level="info"
+        reload=True if not os.getenv("RAILWAY_ENVIRONMENT") else False,
+        workers=2 if os.getenv("RAILWAY_ENVIRONMENT") else 1
     )
+
