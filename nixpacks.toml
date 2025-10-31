@@ -14,4 +14,4 @@ cmds = [
 cmds = []
 
 [start]
-cmd = "gunicorn main:app -w 2 -k uvicorn.workers.UvicornWorker --timeout 120"
+cmd = "uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2"
