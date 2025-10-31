@@ -29,11 +29,10 @@ import time as time_module
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Environment variables with proper defaults and validation
 REDIS_URL = os.getenv("REDIS_URL", "redis://default:EfKXKBdmYeyvsDmqcVmurRzMooouZhHO@redis.railway.internal:6379")
-CACHE_TTL = int(os.getenv("CACHE_TTL", "900"))  # 15 minutes
-RATE_LIMIT_DELAY = float(os.getenv("RATE_LIMIT_DELAY", "2"))  # seconds
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "1800"))  # 30 minutes
+RATE_LIMIT_DELAY = float(os.getenv("RATE_LIMIT_DELAY", "3"))  # seconds
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))
 ALPHA_VANTAGE_KEY = os.getenv("T4MFI6GH6275NKLK", "")
 
 # Log configuration on startup
