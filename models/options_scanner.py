@@ -1,352 +1,458 @@
 """
-Enhanced Options Whale Scanner - ROBUST VERSION
-Handles yfinance failures with multiple fallback methods
+Alternative Data Fetcher - Multiple Sources Strategy
+Handles yfinance rate limiting with fallback mechanisms
 """
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Dict, List, Any
-import warnings
+from typing import Optional, Dict, List
+import asyncio
+import aiohttp
+import json
 import time
-import traceback
-warnings.filterwarnings('ignore')
+import random
+from datetime import datetime, timedelta
+import logging
+from dataclasses import dataclass
+import os
 
-class OptionsWhaleScanner:
-    """Scanner with robust error handling and fallback methods"""
+logger = logging.getLogger(__name__)
+
+# ==================== Data Classes ====================
+
+@dataclass
+class OptionsData:
+    """Structured options data"""
+    ticker: str
+    current_price: float
+    calls: pd.DataFrame
+    puts: pd.DataFrame
+    volume_ratio: float
+    market_cap: float
+    
+# ==================== Proxy & Headers Strategy ====================
+
+class SmartDataFetcher:
+    """Smart fetcher with multiple strategies to avoid rate limiting"""
     
     def __init__(self):
-        self.results = []
-        # Create a session with custom headers
+        self.user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+        ]
+        self.session_pool = []
+        self.last_request_time = {}
+        self.min_delay = 2  # Minimum delay between requests
+        self.max_retries = 3
+        
+        # Initialize session pool
+        self._init_sessions()
+        
+    def _init_sessions(self):
+        """Initialize multiple yfinance sessions with different settings"""
+        for _ in range(3):
+            session = self._create_session()
+            self.session_pool.append(session)
+    
+    def _create_session(self):
+        """Create a session with random headers"""
         import requests
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': random.choice(self.user_agents),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
         })
+        return session
     
-    def scan_single_ticker(self, ticker: str) -> Dict[str, Any]:
-        """
-        Scan a single ticker - ALWAYS returns data
-        """
-        try:
-            options_data = self._get_options_data_safe(ticker)
-            
-            if options_data and options_data.get('current_price', 0) > 0:
-                return self._identify_whale_activity(options_data)
-            else:
-                # Return minimal valid data structure
-                return self._get_minimal_response(ticker)
-                
-        except Exception as e:
-            print(f"⚠️ Error scanning {ticker}: {e}")
-            return self._get_minimal_response(ticker)
+    def _get_session(self):
+        """Get a random session from pool"""
+        return random.choice(self.session_pool)
     
-    def _get_minimal_response(self, ticker: str) -> Dict[str, Any]:
-        """Return minimal valid response when data unavailable"""
-        # Try to at least get the current price
-        price = self._get_price_fallback(ticker)
+    def _rate_limit_wait(self, ticker: str):
+        """Implement smart rate limiting per ticker"""
+        current_time = time.time()
         
-        return {
-            'ticker': ticker,
-            'current_price': price,
-            'volume_ratio': 0,
-            'market_cap': 0,
-            'sentiment': 'DATA_LIMITED' if price > 0 else 'NO_DATA',
-            'sentiment_score': 0,
-            'bullish_percent': 50,
-            'bearish_percent': 50,
-            'total_calls_count': 0,
-            'total_puts_count': 0,
-            'total_calls_value': 0,
-            'total_puts_value': 0,
-            'whale_score': 0,
-            'volatility_plays': 0,
-            'directional_bets': 0,
-            'unusual_activity': [],
-            'expected_move': None,
-            'recommended_strategies': [{
-                'strategy': 'LIMITED DATA - MANUAL RESEARCH RECOMMENDED',
-                'confidence': 'LOW',
-                'rationale': 'Unable to fetch complete options data. Check yfinance or try again later.',
-                'suggested_strikes': 'Visit broker platform for current options',
-                'risk_level': 'UNKNOWN',
-                'profit_target': 'N/A',
-                'stop_loss': 'N/A', 
-                'time_horizon': 'N/A'
-            }],
-            'timestamp': datetime.now().isoformat()
-        }
+        if ticker in self.last_request_time:
+            elapsed = current_time - self.last_request_time[ticker]
+            if elapsed < self.min_delay:
+                sleep_time = self.min_delay - elapsed + random.uniform(0.5, 1.5)
+                time.sleep(sleep_time)
+        
+        self.last_request_time[ticker] = time.time()
     
-    def _get_price_fallback(self, ticker: str) -> float:
-        """Try multiple methods to get current price"""
-        try:
-            # Method 1: Download function (most reliable)
-            data = yf.download(ticker, period="1d", progress=False, threads=False)
-            if not data.empty and 'Close' in data.columns:
-                return float(data['Close'].iloc[-1])
-        except:
-            pass
+    def fetch_with_retry(self, ticker: str, attempt: int = 0) -> Optional[OptionsData]:
+        """Fetch data with exponential backoff retry"""
+        if attempt >= self.max_retries:
+            logger.error(f"❌ {ticker}: Max retries exceeded")
+            return None
         
         try:
-            # Method 2: Ticker with session
-            stock = yf.Ticker(ticker, session=self.session)
-            hist = stock.history(period="1d")
-            if not hist.empty:
-                return float(hist['Close'].iloc[-1])
-        except:
-            pass
-        
-        try:
-            # Method 3: Fast info
-            stock = yf.Ticker(ticker)
-            fast_info = stock.fast_info
-            if hasattr(fast_info, 'lastPrice'):
-                return float(fast_info.lastPrice)
-        except:
-            pass
-        
-        return 0  # Unable to get price
-    
-    def _get_options_data_safe(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """Safely fetch options data with multiple fallback methods"""
-        
-        # Add initial delay to avoid rate limiting
-        time.sleep(0.5)
-        
-        try:
-            # Use session for better reliability
-            stock = yf.Ticker(ticker, session=self.session)
+            # Rate limiting
+            self._rate_limit_wait(ticker)
             
-            # Get price first (most important)
-            current_price = 0
-            volume = 0
-            avg_volume = 1
-            market_cap = 0
+            # Use random session
+            session = self._get_session()
             
-            # Try multiple methods for price
-            try:
-                # Method 1: Regular info
-                info = stock.info
-                current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
-                volume = info.get('volume', 0)
-                avg_volume = info.get('averageVolume', 1)
-                market_cap = info.get('marketCap', 0)
-            except:
-                pass
+            # Create ticker with session
+            stock = yf.Ticker(ticker, session=session)
             
-            if current_price == 0:
-                # Method 2: History
-                try:
-                    hist = stock.history(period="5d")
-                    if not hist.empty:
-                        current_price = float(hist['Close'].iloc[-1])
-                        volume = int(hist['Volume'].iloc[-1])
-                        avg_volume = int(hist['Volume'].mean())
-                except:
-                    pass
+            # Try to get basic info first (less likely to be rate limited)
+            info = stock.info
             
-            if current_price == 0:
-                # Method 3: Download
-                try:
-                    data = yf.download(ticker, period="5d", progress=False, threads=False)
-                    if not data.empty:
-                        current_price = float(data['Close'].iloc[-1])
-                        volume = int(data['Volume'].iloc[-1])
-                        avg_volume = int(data['Volume'].mean())
-                except:
-                    pass
+            if not info:
+                raise ValueError("No info available")
             
-            if current_price == 0:
-                print(f"⚠️ Unable to get price for {ticker}")
+            # Extract price with multiple fallbacks
+            current_price = (
+                info.get('currentPrice') or
+                info.get('regularMarketPrice') or
+                info.get('previousClose') or
+                info.get('ask') or
+                info.get('bid', 0)
+            )
+            
+            if current_price <= 0:
+                raise ValueError("Invalid price")
+            
+            # Get volume metrics
+            volume = info.get('volume', 0)
+            avg_volume = info.get('averageVolume', 1)
+            market_cap = info.get('marketCap', 0)
+            
+            # Get options chain with delay
+            time.sleep(random.uniform(1, 2))
+            expirations = stock.options
+            
+            if not expirations:
+                logger.info(f"ℹ️ {ticker}: No options available")
                 return None
             
-            # Now try to get options data (but don't fail if unavailable)
-            calls_df = pd.DataFrame()
-            puts_df = pd.DataFrame()
+            # Collect limited options data
+            all_calls = []
+            all_puts = []
             
-            try:
-                time.sleep(0.5)  # Rate limit protection
-                expirations = stock.options
-                
-                if expirations and len(expirations) > 0:
-                    # Get just the first expiration to minimize API calls
-                    exp_date = expirations[0]
+            # Only fetch nearest 3 expirations to minimize API calls
+            for exp_date in expirations[:3]:
+                try:
+                    # Add delay between expiration fetches
+                    time.sleep(random.uniform(0.5, 1))
                     
-                    try:
-                        time.sleep(0.5)
-                        opt_chain = stock.option_chain(exp_date)
-                        
-                        calls_df = opt_chain.calls.copy()
-                        calls_df['expiration'] = exp_date
-                        calls_df['type'] = 'call'
-                        
-                        puts_df = opt_chain.puts.copy()
-                        puts_df['expiration'] = exp_date
-                        puts_df['type'] = 'put'
-                        
-                    except Exception as e:
-                        print(f"⚠️ Could not get options for {ticker}: {e}")
-            except Exception as e:
-                print(f"⚠️ No options available for {ticker}: {e}")
+                    opt_chain = stock.option_chain(exp_date)
+                    
+                    calls = opt_chain.calls.copy()
+                    calls['expiration'] = exp_date
+                    calls['days_to_expiry'] = (
+                        datetime.strptime(exp_date, '%Y-%m-%d') - datetime.now()
+                    ).days
+                    
+                    puts = opt_chain.puts.copy()
+                    puts['expiration'] = exp_date
+                    puts['days_to_expiry'] = (
+                        datetime.strptime(exp_date, '%Y-%m-%d') - datetime.now()
+                    ).days
+                    
+                    all_calls.append(calls)
+                    all_puts.append(puts)
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ {ticker}: Failed to fetch {exp_date}: {e}")
+                    continue
             
-            # Return what we have
-            return {
-                'ticker': ticker,
-                'current_price': current_price,
-                'volume': volume,
-                'avg_volume': avg_volume,
-                'volume_ratio': volume / avg_volume if avg_volume > 0 else 0,
-                'market_cap': market_cap,
-                'calls': calls_df,
-                'puts': puts_df
-            }
+            if not all_calls:
+                return None
+            
+            # Combine dataframes
+            calls_df = pd.concat(all_calls, ignore_index=True)
+            puts_df = pd.concat(all_puts, ignore_index=True)
+            
+            return OptionsData(
+                ticker=ticker,
+                current_price=current_price,
+                calls=calls_df,
+                puts=puts_df,
+                volume_ratio=volume / avg_volume if avg_volume > 0 else 0,
+                market_cap=market_cap
+            )
             
         except Exception as e:
-            print(f"❌ Failed to get data for {ticker}: {e}")
-            return None
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                # Rate limited - exponential backoff
+                wait_time = (2 ** attempt) * 10 + random.uniform(5, 10)
+                logger.warning(f"⏳ {ticker}: Rate limited. Waiting {wait_time:.1f}s...")
+                time.sleep(wait_time)
+                return self.fetch_with_retry(ticker, attempt + 1)
+            else:
+                logger.error(f"❌ {ticker}: Error - {e}")
+                return None
+
+# ==================== Batch Processing Strategy ====================
+
+class BatchProcessor:
+    """Process tickers in intelligent batches"""
     
-    def scan_all_sequential(self, tickers: list) -> list:
-        """Scan tickers sequentially - more reliable"""
+    def __init__(self, fetcher: SmartDataFetcher):
+        self.fetcher = fetcher
+        self.batch_size = 2  # Process 2 tickers at a time
+        self.batch_delay = 10  # Delay between batches
+        
+    async def process_tickers(self, tickers: List[str]) -> List[Dict]:
+        """Process tickers in batches with delays"""
         results = []
         
-        for i, ticker in enumerate(tickers, 1):
-            print(f"[{i}/{len(tickers)}] Scanning {ticker}...")
-            result = self.scan_single_ticker(ticker)
-            results.append(result)  # Always append result
-            time.sleep(1)  # Add delay between tickers
+        # Split into batches
+        batches = [tickers[i:i + self.batch_size] 
+                  for i in range(0, len(tickers), self.batch_size)]
+        
+        logger.info(f"📦 Processing {len(tickers)} tickers in {len(batches)} batches")
+        
+        for i, batch in enumerate(batches):
+            logger.info(f"🔄 Processing batch {i+1}/{len(batches)}: {batch}")
+            
+            # Process batch in parallel using threads (yfinance is sync)
+            batch_results = await self._process_batch(batch)
+            results.extend(batch_results)
+            
+            # Delay between batches (except last)
+            if i < len(batches) - 1:
+                logger.info(f"⏸️ Batch delay: {self.batch_delay}s")
+                await asyncio.sleep(self.batch_delay)
         
         return results
     
-    def scan_all_parallel(self, tickers: list, max_workers: int = 2) -> list:
-        """Scan tickers in parallel - use sequential for now due to rate limits"""
-        # For now, just use sequential to avoid rate limiting issues
-        return self.scan_all_sequential(tickers)
+    async def _process_batch(self, batch: List[str]) -> List[Dict]:
+        """Process a single batch of tickers"""
+        loop = asyncio.get_event_loop()
+        tasks = []
+        
+        for ticker in batch:
+            # Run sync fetch in thread pool
+            task = loop.run_in_executor(None, self._fetch_and_analyze, ticker)
+            tasks.append(task)
+        
+        results = await asyncio.gather(*tasks)
+        return [r for r in results if r is not None]
     
-    def _identify_whale_activity(self, options_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process options data - always returns valid structure
-        """
-        ticker = options_data['ticker']
-        current_price = options_data['current_price']
-        calls = options_data.get('calls', pd.DataFrame())
-        puts = options_data.get('puts', pd.DataFrame())
+    def _fetch_and_analyze(self, ticker: str) -> Optional[Dict]:
+        """Fetch and analyze single ticker"""
+        data = self.fetcher.fetch_with_retry(ticker)
         
-        # Calculate basic metrics
-        total_calls_vol = 0
-        total_puts_vol = 0
+        if data is None:
+            return None
         
-        if not calls.empty and 'volume' in calls.columns:
-            total_calls_vol = calls['volume'].sum()
+        # Analyze the data
+        return self._analyze_options(data)
+    
+    def _analyze_options(self, data: OptionsData) -> Dict:
+        """Analyze options data for signals"""
         
-        if not puts.empty and 'volume' in puts.columns:
-            total_puts_vol = puts['volume'].sum()
+        # Filter for liquid options
+        liquid_calls = data.calls[
+            (data.calls['volume'] > 50) & 
+            (data.calls['openInterest'] > 25)
+        ].copy() if not data.calls.empty else pd.DataFrame()
         
-        total_vol = total_calls_vol + total_puts_vol
+        liquid_puts = data.puts[
+            (data.puts['volume'] > 50) & 
+            (data.puts['openInterest'] > 25)
+        ].copy() if not data.puts.empty else pd.DataFrame()
+        
+        # Calculate metrics
+        if not liquid_calls.empty:
+            liquid_calls['volume_oi_ratio'] = liquid_calls['volume'] / (liquid_calls['openInterest'] + 1)
+            liquid_calls['total_value'] = liquid_calls['volume'] * liquid_calls['lastPrice'] * 100
+            liquid_calls['whale_score'] = (
+                np.log1p(liquid_calls['total_value']) * 0.5 +
+                liquid_calls['volume_oi_ratio'] * 50
+            )
+        
+        if not liquid_puts.empty:
+            liquid_puts['volume_oi_ratio'] = liquid_puts['volume'] / (liquid_puts['openInterest'] + 1)
+            liquid_puts['total_value'] = liquid_puts['volume'] * liquid_puts['lastPrice'] * 100
+            liquid_puts['whale_score'] = (
+                np.log1p(liquid_puts['total_value']) * 0.5 +
+                liquid_puts['volume_oi_ratio'] * 50
+            )
         
         # Calculate sentiment
-        if total_vol > 0:
-            bullish_percent = (total_calls_vol / total_vol * 100)
-            bearish_percent = (total_puts_vol / total_vol * 100)
+        total_call_value = liquid_calls['total_value'].sum() if not liquid_calls.empty else 0
+        total_put_value = liquid_puts['total_value'].sum() if not liquid_puts.empty else 0
+        total_value = total_call_value + total_put_value
+        
+        if total_value > 0:
+            bullish_pct = (total_call_value / total_value) * 100
+            bearish_pct = (total_put_value / total_value) * 100
         else:
-            bullish_percent = 50
-            bearish_percent = 50
+            bullish_pct = bearish_pct = 50
         
         # Determine sentiment
-        net_sentiment = bullish_percent - bearish_percent
-        
-        if net_sentiment > 20:
+        if bullish_pct > 65:
+            sentiment = "STRONG BULLISH"
+            sentiment_score = bullish_pct
+        elif bullish_pct > 55:
             sentiment = "BULLISH"
-            sentiment_score = min(100, 50 + net_sentiment/2)
-        elif net_sentiment < -20:
+            sentiment_score = bullish_pct
+        elif bearish_pct > 65:
+            sentiment = "STRONG BEARISH"
+            sentiment_score = -bearish_pct
+        elif bearish_pct > 55:
             sentiment = "BEARISH"
-            sentiment_score = max(-100, -50 + net_sentiment/2)
+            sentiment_score = -bearish_pct
         else:
             sentiment = "NEUTRAL"
-            sentiment_score = net_sentiment/2
+            sentiment_score = 0
         
-        # Process unusual activity if data available
-        unusual_list = []
-        if not calls.empty and not puts.empty:
-            try:
-                all_options = pd.concat([calls, puts], ignore_index=True)
-                
-                # Look for high volume options
-                if 'volume' in all_options.columns and 'openInterest' in all_options.columns:
-                    all_options['vol_oi_ratio'] = all_options['volume'] / all_options['openInterest'].replace(0, 1)
-                    
-                    # Get top 5 by volume
-                    top_options = all_options.nlargest(5, 'volume')
-                    
-                    for _, row in top_options.iterrows():
-                        if row['volume'] > 0:
-                            unusual_list.append({
-                                'option_type': row['type'].upper(),
-                                'strike': float(row['strike']),
-                                'expiration': row.get('expiration', 'N/A'),
-                                'volume': int(row['volume']),
-                                'openInterest': int(row.get('openInterest', 0)),
-                                'vol_oi_ratio': float(row.get('vol_oi_ratio', 0)),
-                                'lastPrice': float(row.get('lastPrice', 0)),
-                                'distance_from_price': ((row['strike'] - current_price) / current_price * 100)
-                            })
-            except Exception as e:
-                print(f"⚠️ Error processing options for {ticker}: {e}")
-        
-        # Generate basic strategy
-        strategies = []
-        if sentiment == "BULLISH":
-            strategies.append({
-                'strategy': 'BULLISH MOMENTUM - CONSIDER CALLS',
-                'confidence': 'MEDIUM',
-                'rationale': f'Call volume dominates ({bullish_percent:.0f}% bullish)',
-                'suggested_strikes': f'ATM or slightly OTM calls around ${current_price:.0f}',
-                'risk_level': 'MEDIUM',
-                'profit_target': '+5-10%',
-                'stop_loss': '-30% of premium',
-                'time_horizon': '1-4 weeks'
-            })
-        elif sentiment == "BEARISH":
-            strategies.append({
-                'strategy': 'BEARISH PRESSURE - CONSIDER PUTS',
-                'confidence': 'MEDIUM',
-                'rationale': f'Put volume dominates ({bearish_percent:.0f}% bearish)',
-                'suggested_strikes': f'ATM or slightly OTM puts around ${current_price:.0f}',
-                'risk_level': 'MEDIUM',
-                'profit_target': '-5-10%',
-                'stop_loss': '-30% of premium',
-                'time_horizon': '1-4 weeks'
-            })
-        else:
-            strategies.append({
-                'strategy': 'NEUTRAL MARKET - RANGE-BOUND STRATEGIES',
-                'confidence': 'LOW',
-                'rationale': f'Balanced call/put activity ({bullish_percent:.0f}%/{bearish_percent:.0f}%)',
-                'suggested_strikes': 'Consider iron condors or calendar spreads',
-                'risk_level': 'LOW-MEDIUM',
-                'profit_target': 'Collect premium',
-                'stop_loss': 'Exit if price breaks range',
-                'time_horizon': '1-2 weeks'
-            })
+        # Find top unusual activity
+        top_whale = None
+        if not liquid_calls.empty or not liquid_puts.empty:
+            all_options = pd.concat([liquid_calls, liquid_puts], ignore_index=True)
+            if not all_options.empty and 'whale_score' in all_options.columns:
+                top_whale = all_options.nlargest(1, 'whale_score').iloc[0]
         
         return {
-            'ticker': ticker,
-            'current_price': current_price,
-            'volume_ratio': options_data.get('volume_ratio', 0),
-            'market_cap': options_data.get('market_cap', 0),
-            'sentiment': sentiment,
-            'sentiment_score': float(sentiment_score),
-            'bullish_percent': float(bullish_percent),
-            'bearish_percent': float(bearish_percent),
-            'total_calls_count': int(total_calls_vol),
-            'total_puts_count': int(total_puts_vol),
-            'total_calls_value': 0,
-            'total_puts_value': 0,
-            'whale_score': len(unusual_list) * 10,  # Simple score based on activity
-            'volatility_plays': 0,
-            'directional_bets': len(unusual_list),
-            'unusual_activity': unusual_list,
-            'expected_move': None,
-            'recommended_strategies': strategies,
-            'timestamp': datetime.now().isoformat()
+            "ticker": data.ticker,
+            "current_price": data.current_price,
+            "volume_ratio": data.volume_ratio,
+            "market_cap": data.market_cap,
+            "sentiment": sentiment,
+            "sentiment_score": sentiment_score,
+            "bullish_percent": bullish_pct,
+            "bearish_percent": bearish_pct,
+            "total_calls_count": len(liquid_calls),
+            "total_puts_count": len(liquid_puts),
+            "total_calls_value": total_call_value,
+            "total_puts_value": total_put_value,
+            "whale_score": top_whale['whale_score'] if top_whale is not None else 0,
+            "top_whale_strike": float(top_whale['strike']) if top_whale is not None else 0,
+            "timestamp": datetime.now().isoformat()
         }
+
+# ==================== Cache Layer ====================
+
+class DataCache:
+    """Simple in-memory cache with TTL"""
+    
+    def __init__(self, ttl_seconds: int = 900):
+        self.cache = {}
+        self.ttl = ttl_seconds
+    
+    def get(self, key: str) -> Optional[Dict]:
+        """Get from cache if not expired"""
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return data
+            else:
+                del self.cache[key]
+        return None
+    
+    def set(self, key: str, data: Dict):
+        """Set cache with timestamp"""
+        self.cache[key] = (data, time.time())
+    
+    def clear_expired(self):
+        """Remove expired entries"""
+        current_time = time.time()
+        expired = [k for k, (_, t) in self.cache.items() 
+                  if current_time - t >= self.ttl]
+        for key in expired:
+            del self.cache[key]
+
+# ==================== Main Scanner ====================
+
+class EnhancedOptionsScanner:
+    """Main scanner with all strategies combined"""
+    
+    def __init__(self):
+        self.fetcher = SmartDataFetcher()
+        self.processor = BatchProcessor(self.fetcher)
+        self.cache = DataCache()
+        
+    async def scan_market(self, tickers: List[str], use_cache: bool = True) -> Dict:
+        """Scan market with smart strategies"""
+        
+        # Check cache first
+        if use_cache:
+            cached_results = []
+            uncached_tickers = []
+            
+            for ticker in tickers:
+                cached = self.cache.get(ticker)
+                if cached:
+                    cached_results.append(cached)
+                else:
+                    uncached_tickers.append(ticker)
+            
+            if cached_results and not uncached_tickers:
+                logger.info(f"✅ All {len(cached_results)} results from cache")
+                return {
+                    "results": cached_results,
+                    "from_cache": True,
+                    "total": len(cached_results)
+                }
+            
+            tickers = uncached_tickers
+            logger.info(f"📊 Fetching {len(tickers)} tickers (cached: {len(cached_results)})")
+        else:
+            cached_results = []
+        
+        # Process uncached tickers
+        results = await self.processor.process_tickers(tickers)
+        
+        # Update cache
+        for result in results:
+            self.cache.set(result['ticker'], result)
+        
+        # Combine with cached results
+        all_results = cached_results + results
+        
+        # Sort by whale score
+        all_results.sort(key=lambda x: x.get('whale_score', 0), reverse=True)
+        
+        # Clear expired cache entries
+        self.cache.clear_expired()
+        
+        return {
+            "results": all_results,
+            "from_cache": use_cache and len(cached_results) > 0,
+            "total": len(all_results),
+            "cached": len(cached_results),
+            "fetched": len(results)
+        }
+
+# ==================== Usage Example ====================
+
+async def example_usage():
+    """Example of how to use the enhanced scanner"""
+    
+    # Initialize scanner
+    scanner = EnhancedOptionsScanner()
+    
+    # Define tickers
+    tickers = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "TSM", "META", "GOOGL"]
+    
+    # Scan market
+    print("🚀 Starting market scan...")
+    results = await scanner.scan_market(tickers)
+    
+    print(f"\n📊 Scan Results:")
+    print(f"Total: {results['total']}")
+    print(f"From Cache: {results['from_cache']}")
+    
+    # Display top movers
+    for result in results['results'][:3]:
+        print(f"\n{result['ticker']}:")
+        print(f"  Price: ${result['current_price']:.2f}")
+        print(f"  Sentiment: {result['sentiment']} ({result['sentiment_score']:.1f}%)")
+        print(f"  Whale Score: {result['whale_score']:.1f}")
+
+if __name__ == "__main__":
+    # Run example
+    asyncio.run(example_usage())
+
