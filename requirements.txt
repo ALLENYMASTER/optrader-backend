@@ -2,6 +2,7 @@ fastapi==0.115.13
 uvicorn==0.32.0
 gunicorn==23.0.0  # Required for production deployment
 aiohttp==3.11.10
+hiredis==3.0.0
 pydantic==2.9.2
 yfinance==0.2.49  # Latest version
 pandas==2.2.3
